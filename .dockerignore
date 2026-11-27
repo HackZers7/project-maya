@@ -1,0 +1,49 @@
+# The Docker build context is this repository (docker compose build; docker/build.sh archives
+# the committed tree instead, so this file only shapes compose's context). What git ignores as
+# generated stays out of the context too, while .git itself travels - the Dockerfile's source
+# stage needs it for the dirty-tree check and the commit it records, and strips it before the
+# image is built.
+/.venv/
+/build*/
+/engine/
+/models/
+/packs/
+/mtp/
+/logs/
+/dist/
+/third_party/llama.cpp/
+/third_party/*.zip
+/.bench-builds/
+/.bench-logs/
+/answers/
+/data/golden/
+/data/glm-link-cpu-cal.txt
+/data/hy4-cpu-lane.txt*
+/data/vram-room.json
+bench/tiny-*.gguf
+bench/wide-*.gguf
+bench/micro/*.exe
+bench/micro/*.obj
+bench/micro/*.bin
+bench/micro/*.dll
+bench/micro/*.txt
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+*.nsys-rep
+*.sqlite
+*.npz
+*.occ1
+run-*.bat
+run-*.sh
+build-*.bat
+strata-*.json
+strata-*.log
+maya-*.json
+maya-*.json.prev
+maya-*.json.bak-*
+maya-nightly*
+maya-report.txt
+maya-bench*.txt
+build-vision*/
