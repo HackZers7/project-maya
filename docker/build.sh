@@ -93,7 +93,7 @@ check_image() {
 
   # the local source is in the tree: an image of an un-patched Maya never ships
   "${run[@]}" test "$ref" -f /opt/project-maya/src/core/glm_ablate.cuh || die "$ref carries no ablation kernels (src/core/glm_ablate.cuh)"
-  "${run[@]}" grep -q MAYA_START_UNLOADED /opt/project-maya/serve/server.py || die "$ref's serve/server.py has no MAYA_START_UNLOADED"
+  "${run[@]}" grep "$ref" -q MAYA_START_UNLOADED /opt/project-maya/serve/server.py || die "$ref's serve/server.py has no MAYA_START_UNLOADED"
   say "check: the local commits are in the tree (the ablation kernels, the deferred start)"
 
   for e in maya maya-hy4; do
