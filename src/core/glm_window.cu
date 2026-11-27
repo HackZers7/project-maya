@@ -15,6 +15,7 @@
 #include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the mixer's window rows
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
+#include "glm_ablate.cuh"
 #include "maya/core/glm_model.hpp"
 #include "maya/kernels/exl3.hpp"
 #include "maya/core/glm_req_knobs.hpp"   // glm-dsa request knobs
@@ -1008,6 +1009,15 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
         // (--ablate: the window's rows are the bound conversation's - their writes lose the direction first)
         if (!attn) ablate(W.mixer + (size_t) t0 * E, n, s);
         else if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);
+        if (attn) {   // STRATA_GLM_ABLATE: both operands of layer il - 1's FFN write
+            if (il != l0_) {
+                glm_ablate::rows(W.ffn + (size_t) t0 * E, n, E, s);
+                glm_ablate::layer_rows(il - 1, W.ffn + (size_t) t0 * E, n, E, s);
+                glm_ablate::layer_rows(il - 1, W.R[rc] + (size_t) t0 * hcE, (size_t) g.hc * n, E, s);
+            }
+        } else {
+            glm_ablate::rows(W.mixer + (size_t) t0 * E, n, E, s);   // STRATA_GLM_ABLATE: the mixer's write
+        }
         // (n == T: only when the window runs in one pass.  In the two staggered groups a group's fused launch gave
         //  answers that changed run to run on one Tesla V100 32 GB with a CPU lane on a 2-socket Xeon - 3 starts, 3
         //  answers, MAYA_GLM_REPEATABLE=1 - and with one launch a token there the answers are the old ones.  The cause
@@ -1144,6 +1154,9 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     // the last layer's write half: R (in the other buffer) = post x ffn + comb . R
     const int rc = rc_in[(size_t) (l1_ - l0_)];
     ablate(W.ffn, T, s);
+    glm_ablate::rows(W.ffn, T, E, s);   // STRATA_GLM_ABLATE
+    glm_ablate::layer_rows(l1_ - 1, W.ffn, T, E, s);
+    glm_ablate::layer_rows(l1_ - 1, W.R[rc] + (size_t) 0, (size_t) g.hc * T, E, s);
     for (int t = 0; t < T; ++t)
         gf::hc_post(W.ffn + (size_t) t * E, W.R[rc] + (size_t) t * hcE, W.post + (size_t) t * 8,
                     W.comb + (size_t) t * 16, E, W.R[rc ^ 1] + (size_t) t * hcE, s);
@@ -1258,6 +1271,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
             if (const float* img = image_row(p0 + t)) std::memcpy(row, img, (size_t) E * sizeof(float));
         }
         cudaMemcpyAsync(W.emb, W.emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+        glm_ablate::rows(W.emb, T, E, F->cs);   // STRATA_GLM_ABLATE
         for (int t = 0; t < T; ++t)
             if (g.mhc())
                 gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
@@ -1523,6 +1537,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
                         cudaMemcpyHostToDevice, F->cs);
+        glm_ablate::rows(W.emb + (size_t) sl * E, 1, E, F->cs);   // STRATA_GLM_ABLATE
         gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);

@@ -32,6 +32,7 @@
 // pinned per conversation: its embedding rows (first part), the hop rows (every part but the last), the picks and the
 // NextN cache rows' embeddings (last part); on the last part the rows' trunk hidden states and a draft chain's state.
 #include "glm_rows_state.hpp"
+#include "glm_ablate.cuh"
 
 #include "maya/core/mtp_rows.hpp"
 #include "maya/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
@@ -374,6 +375,7 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
                 tt->to_float(pack_emb_src_ + (size_t) tokens[row + t] * emb_row, e, E);
                 if (rw[row + t].img != nullptr) std::memcpy(e, rw[row + t].img, (size_t) E * sizeof(float));
                 cudaMemcpyAsync(F->emb, e, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+                glm_ablate::rows(F->emb, 1, E, s);   // STRATA_GLM_ABLATE
                 gf::embed_streams(F->emb, rw[row + t].res, E, s);
             }
     } else {

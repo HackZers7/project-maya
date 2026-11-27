@@ -22,6 +22,7 @@
 #include "glm_dsa_prefill_stream.hpp"   // glm-dsa B9.9
 #include "maya/kernels/glmd_f16_guard.hpp"   // glm-dsa B15.1
 #include "maya/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
+#include "glm_ablate.cuh"
 
 #include "maya/core/exl3_mma_rows.hpp"
 #include "maya/core/prefill_chunks.hpp"
@@ -2327,6 +2328,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                              const float* norm) {
         // (--ablate: the chunk's rows are the bound conversation's - the write they join loses the direction first)
         if (block_out != nullptr) ablate(const_cast<float*>(block_out), (int) T, s);
+        glm_ablate::rows(const_cast<float*>(block_out), T, E, s);   // STRATA_GLM_ABLATE (nullptr: no write)
         if (!g.mhc()) { glmpf::res_read(pio, block_out, norm, err); return; }   // glm-dsa B9.1: plain residual
         gb::hc_update(block_out, S->R, S->post, S->comb, S->ss, T, E, s);
         sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
@@ -2912,6 +2914,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             for (const auto& q : hp)
                 if (q.ev != nullptr) cudaStreamWaitEvent(s, q.ev, 0);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
+        if (il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il - 1's FFN write
+            glm_ablate::layer_rows(il - 1, S->ffn, T, E, s);
+            glm_ablate::layer_rows(il - 1, S->R, g.mhc() ? 4 * T : T, E, s);
+        }
         hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
         S->mark("hc", s);
         // S->R: the layer's input rows - the DFlash drafter's features when it reads this layer (the stream means go
@@ -4659,6 +4665,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // the last layer's write half: R = post x ffn + comb . R
     if (!tail_skip) {
         ablate(S->ffn, (int) T, s);   // (--ablate: the part's last FFN write)
+        glm_ablate::rows(S->ffn, T, E, s);   // STRATA_GLM_ABLATE
+        glm_ablate::layer_rows(l1_ - 1, S->ffn, T, E, s);
+        glm_ablate::layer_rows(l1_ - 1, S->R, g.mhc() ? 4 * T : T, E, s);
         if (!g.mhc()) { if (!glmpf::res_close(pio, S->ffn, err)) return false; } else   // glm-dsa B9.1: plain residual
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
@@ -5210,6 +5219,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
+        glm_ablate::rows(S->x, T, E, fast_->cs);   // STRATA_GLM_ABLATE
         if (g_.mhc()) gb::embed_rows(S->x, S->R, T, E, fast_->cs); else cudaMemcpyAsync(S->R, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);   // glm-dsa B9.1: plain residual
         return true;
     };

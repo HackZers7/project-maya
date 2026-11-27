@@ -17,6 +17,7 @@
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
+#include "glm_ablate.cuh"
 #include "maya/core/glm_dsa_split.hpp"   // glm-dsa B6.1 / B6.2
 #include "maya/core/glm_dsa_spec.hpp"   // glm-dsa B11.2
 #include "maya/core/glm_pool_classes.hpp"   // glm-dsa B3.7
@@ -2292,6 +2293,7 @@ bool Glm5Model::step_issue(int32_t token, int64_t& p, std::string& err) {
             GM_CHECK(cudaMemcpy(emb, w_.at("token_embd.weight") + (int64_t) g.n_embd * token,
                                 (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice), err);
         }
+        if (!g.mhc()) glm_ablate::rows(emb, 1, g.n_embd, nullptr);   // STRATA_GLM_ABLATE: the DSA slow path's embedding
         for (int s = 0; s < g.hc; ++s)
             GM_CHECK(cudaMemcpy(R + (int64_t) g.n_embd * s, emb, (size_t) g.n_embd * sizeof(float),
                                 cudaMemcpyDeviceToDevice), err);

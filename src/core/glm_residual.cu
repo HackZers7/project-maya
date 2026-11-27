@@ -12,6 +12,7 @@
 #include "glm_dsa_fast.hpp"
 #include "glm_fast_state.hpp"
 #include "glm_memory.hpp"
+#include "glm_ablate.cuh"
 #include "maya/core/glm_req_knobs.hpp"
 
 #include <cstdio>
@@ -119,7 +120,12 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
             return false;
         }
         // ---- the attention-side read (fused with the previous FFN's residual add)
-        if (il != l0_) ablate(F->ffn, 1, s);   // (--ablate: the previous FFN's write loses the direction)
+        if (il != l0_) {
+            ablate(F->ffn, 1, s);   // (--ablate: the previous FFN's write loses the direction)
+            glm_ablate::rows(F->ffn, 1, E, s);   // STRATA_GLM_ABLATE
+            glm_ablate::layer_rows(il - 1, F->ffn, 1, E, s);
+            glm_ablate::layer_rows(il - 1, R, 1, E, s);
+        }
         glmres::res_read(R, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
         if (F->prof_on) F->mark("res_attn");
         // R now holds the layer's input (the previous FFN's add is in): the DFlash2 drafter's feature when it reads
@@ -135,6 +141,7 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
 
         // ---- the FFN-side read (fused with the mixer's residual add)
         ablate(F->mixer, 1, s);   // (--ablate: the mixer's write)
+        glm_ablate::rows(F->mixer, 1, E, s);   // STRATA_GLM_ABLATE
         glmres::res_read(R, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
         if (F->prof_on) F->mark("res_ffn");
         if (dumps) {
@@ -165,6 +172,9 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
     // the part's last FFN output closes the residual (the hop and the head read R complete)
     if (l1_ > l0_) {
         ablate(F->ffn, 1, s);
+        glm_ablate::rows(F->ffn, 1, E, s);   // STRATA_GLM_ABLATE
+        glm_ablate::layer_rows(l1_ - 1, F->ffn, 1, E, s);
+        glm_ablate::layer_rows(l1_ - 1, R, 1, E, s);
         glmres::res_close(R, F->ffn, E, s);
         if (F->prof_on) F->mark("res_close");
         if (dumps) plain_dump(s, "l_out-" + std::to_string(l1_ - 1), R, E);
@@ -218,7 +228,12 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     // up to its routes (moe part 1), or all of it (part 0 / a dense FFN); the second half (part 2): the experts
     const auto pre = [&](int il, int t0, int n, int moe_part, int gid) -> bool {
         const auto& Ly = F->L[(size_t) il];
-        if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);   // (--ablate: the window's rows, the bound conversation's)
+        if (il != l0_) {
+            ablate(W.ffn + (size_t) t0 * E, n, s);   // (--ablate: the window's rows, the bound conversation's)
+            glm_ablate::rows(W.ffn + (size_t) t0 * E, n, E, s);   // STRATA_GLM_ABLATE
+            glm_ablate::layer_rows(il - 1, W.ffn + (size_t) t0 * E, n, E, s);
+            glm_ablate::layer_rows(il - 1, R + (size_t) t0 * E, n, E, s);
+        }
         for (int t = t0; t < t0 + n; ++t)
             glmres::res_read(R + (size_t) t * E, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps,
                              E, W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
@@ -229,6 +244,7 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
         if (!fast_dsa_glm_window(il, p0, t0, n, W.x, W.xq, W.xq_s, W.mixer, err)) return false;
         mark("dsa");
         ablate(W.mixer + (size_t) t0 * E, n, s);
+        glm_ablate::rows(W.mixer + (size_t) t0 * E, n, E, s);   // STRATA_GLM_ABLATE
         for (int t = t0; t < t0 + n; ++t)
             glmres::res_read(R + (size_t) t * E, W.mixer + (size_t) t * E, Ly.ffn_norm, g.norm_eps, E,
                              W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
@@ -293,6 +309,9 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     }
     // each row's last FFN output closes its residual (the hop and the head read the rows complete)
     ablate(W.ffn, T, s);
+    glm_ablate::rows(W.ffn, T, E, s);   // STRATA_GLM_ABLATE
+    glm_ablate::layer_rows(l1_ - 1, W.ffn, T, E, s);
+    glm_ablate::layer_rows(l1_ - 1, R, T, E, s);
     for (int t = 0; t < T; ++t) glmres::res_close(R + (size_t) t * E, W.ffn + (size_t) t * E, E, s);
     W.out = 0;
     const cudaError_t e = cudaGetLastError();

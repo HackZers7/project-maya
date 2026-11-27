@@ -42,6 +42,7 @@
 // Environment: MAYA_GLMD_TILE_MB (each of the two dequant tiles' cap, default 512), MAYA_GLMD_KQ_SCALE (a
 // different attention scale, for mutation runs only).
 #include "maya/core/glm_model.hpp"
+#include "glm_ablate.cuh"
 #include "maya/kernels/dequant_bf16.hpp"
 #include "maya/kernels/glmd_forward.hpp"
 #include "maya/kernels/glmd_ref.hpp"
@@ -671,6 +672,7 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
         if (!mv(P + "attn_output.weight", R.attn, R.mix, (int64_t) H * VH, E)) return false;
         cb_dev(N("attn_out"), R.mix, E);
         ablate(R.mix, 1, nullptr);   // (--ablate: the write loses the direction)
+        glm_ablate::rows(R.mix, 1, E, nullptr);   // STRATA_GLM_ABLATE
         add(Rs, R.mix, E);
         cb_dev(N("ffn_inp"), Rs, E);
 
@@ -734,6 +736,9 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
         }
         cb_dev(N("ffn_out"), R.ffn, E);
         ablate(R.ffn, 1, nullptr);
+        glm_ablate::rows(R.ffn, 1, E, nullptr);   // STRATA_GLM_ABLATE
+        glm_ablate::layer_rows(il, R.ffn, 1, E, nullptr);
+        glm_ablate::layer_rows(il, Rs, 1, E, nullptr);
         add(Rs, R.ffn, E);
         cb_dev(N("l_out"), Rs, E);
         if (!cuda_ok(cudaGetLastError(), ("layer " + L).c_str(), err)) return false;

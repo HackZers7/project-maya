@@ -11,6 +11,7 @@
 // head.  This version: GLM-5.3-Flash GGUF packs, every expert slice in VRAM, the token path only (prompts too).
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"
+#include "glm_ablate.cuh"
 #include "maya/core/glm_model.hpp"
 #include "maya/kernels/glm_fast.hpp"
 
@@ -489,6 +490,7 @@ bool Glm5Model::fast_token_tp(int32_t token, std::string& err) {
         FastState* F = m->fast_;
         cudaSetDevice(m->dev_);
         cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+        glm_ablate::rows(F->emb, 1, g.n_embd, F->cs);   // STRATA_GLM_ABLATE
         glmres::res_embed(m->g_, F->emb, m->state_, F->cs);
         bool ok = m->fast_layers(p, false, errs[(size_t) i]);
         if (ok && m->tp_.head) {

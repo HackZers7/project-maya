@@ -28,6 +28,7 @@
 // (gf::mla_out) - the verify window's batched MLA, for rows of different conversations.  Each row's output is mla()'s
 // bit for bit (glm_rows_attn_test compares them).
 #include "glm_rows_state.hpp"
+#include "glm_ablate.cuh"
 
 #include "maya/core/mtp_rows.hpp"
 #include "maya/kernels/exl3.hpp"
@@ -278,6 +279,7 @@ bool Glm5Model::rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::
         tt->to_float(pack_emb_src_ + (size_t) tokens[i] * emb_row, c.emb_h, E);
         if (rw[i].img != nullptr) std::memcpy(c.emb_h, rw[i].img, (size_t) E * sizeof(float));
         cudaMemcpyAsync(F->emb, c.emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+        glm_ablate::rows(F->emb, 1, E, s);   // STRATA_GLM_ABLATE
         gf::embed_streams(F->emb, rw[i].res, E, s);
     }
     return true;
@@ -321,6 +323,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
         h.part = F->part;
         h.counter = F->counter;
         const auto hc_row = [&](int i, const float* block_out) {
+            glm_ablate::rows(const_cast<float*>(block_out), 1, E, s);   // STRATA_GLM_ABLATE (nullptr: no write)
             h.block_out = block_out;
             h.R_old = rw[i].Rc;
             h.R_new = rw[i].Ro;
@@ -340,6 +343,12 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             hb[i].counter = (unsigned int*) (S->hc_ctr + (size_t) i * 64);   // (take(64): 64 bytes a row)
         };
         // ---- the attention-side read (fused with the previous FFN's write), per row
+        if (il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il - 1's FFN write
+            for (int i = 0; i < n; ++i) {
+                glm_ablate::layer_rows(il - 1, rows(S->ffn, E, i), 1, E, s);
+                glm_ablate::layer_rows(il - 1, rw[i].Rc, g.hc, E, s);
+            }
+        }
         h.w_fn = Ly.hc_attn_fn;
         h.w_scale = Ly.hc_attn_scale;
         h.w_base = Ly.hc_attn_base;
@@ -458,6 +467,9 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
     ablate_runs(S->ffn, abl_seqs, n, s);
     for (int i = 0; i < n; ++i) {
+        glm_ablate::rows(rows(S->ffn, E, i), 1, E, s);   // STRATA_GLM_ABLATE (outputs mode)
+        glm_ablate::layer_rows(l1_ - 1, rows(S->ffn, E, i), 1, E, s);
+        glm_ablate::layer_rows(l1_ - 1, rw[i].Rc, g.hc, E, s);
         gf::hc_post(rows(S->ffn, E, i), rw[i].Rc, rows(S->post, 8, i), rows(S->comb, 16, i), E, rw[i].Ro, s);
         if (rw[i].Ro != rw[i].res)
             cudaMemcpyAsync(rw[i].res, rw[i].Ro, (size_t) g.hc * E * sizeof(float), cudaMemcpyDeviceToDevice, s);

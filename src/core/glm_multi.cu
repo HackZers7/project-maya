@@ -13,6 +13,7 @@
 // for the oldest sequence's token (multi_take), and issues that sequence's next one right away.
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa B2.3 (W6 fix)
+#include "glm_ablate.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -229,6 +230,7 @@ bool Glm5Model::multi_issue(int s, int32_t token, const maya::kernels::SamplerPa
     if (const float* img = image_row(p)) std::memcpy(c.emb_h, img, (size_t) g.n_embd * sizeof(float));
     cudaSetDevice(dev_);
     cudaMemcpyAsync(F->emb, c.emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    glm_ablate::rows(F->emb, 1, g.n_embd, F->cs);   // STRATA_GLM_ABLATE
     glmres::res_embed(g, F->emb, state_, F->cs);   // glm-dsa B2.3 (mHC: gf::embed_streams)
     if (!fast_layers(p, false, err)) return false;
     Glm5Model* tail = this;
