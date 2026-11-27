@@ -3493,6 +3493,19 @@ class Service:
         with self.status_lock:
             return bool(self.reload) and self.reload.get("state") in ("waiting", "running")
 
+    def engine_ready(self) -> bool:
+        """The engine process is up and has reported its READY line (max_context > 0): the model can serve
+        requests - the llama.cpp status endpoints' "loaded" (DGate completes a model start only on it)."""
+        return ((not hasattr(self.engine, "alive") or self.engine.alive())
+                and self.engine.max_context > 0)
+
+    def engine_starting(self) -> bool:
+        """The engine process is up but has not reported READY yet (max_context is still 0 from the spawn to
+        the READY stdout line): the load is running - the status endpoints' "loading".  (Not keyed on
+        `unloaded`: it stays True all through ensure_engine's start.)"""
+        return (hasattr(self.engine, "alive") and self.engine.alive()
+                and self.engine.max_context <= 0)
+
     def context_limits(self) -> dict:
         """The dashboard's Context size: the range it offers and the engine's measured cost of the current one."""
         info = dict(getattr(self.engine, "info", {}) or {})
@@ -6552,7 +6565,7 @@ def make_handler(svc: Service):
                 else:
                     self._json(200, {"model": name, "status": {"value": "unloaded"}})
                 return
-            if hasattr(svc.engine, "alive") and svc.engine.alive():
+            if svc.engine_ready():
                 self._json(200, {"model": name, "status": {"value": "loaded"}})
                 return
             if not svc.fifo.acquire(blocking=True):
@@ -6842,8 +6855,8 @@ def make_handler(svc: Service):
             self.end_headers()
             try:
                 while True:
-                    alive = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    value = "loaded" if alive else ("unloaded" if svc.unloaded else "loading")
+                    value = ("loaded" if svc.engine_ready() else
+                             "loading" if svc.engine_starting() else "unloaded")
                     payload = {"object": "list", "data": [{"id": svc.model, "status": {"value": value}}]}
                     self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
                     self.wfile.flush()
@@ -7109,8 +7122,14 @@ def make_handler(svc: Service):
                             rec["reasoning_effort"]
                 # Hy4-flash alone: its two levels (the page offers these and no others)
                 levels = svc.template.thinking_levels()
-                self._json(200, {"status": "updating" if svc.updater.busy() else
-                                           "reloading" if svc.reloading() else "ok",
+                # a start is the one state /health fails closed on (503): a router's readiness probe (DGate's
+                # PollReadinessAsync) must not pass while the engine is still loading (the chat path's guard at
+                # "the model is starting" is the second net) - the body still carries the truthful max_context
+                starting = svc.engine_starting()
+                self._json(503 if starting else 200,
+                           {"status": "loading" if starting else
+                                       "updating" if svc.updater.busy() else
+                                       "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
                                  "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3-Flash · Maya-S24")
@@ -7186,9 +7205,10 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
+                    value = ("loaded" if svc.engine_ready() else
+                             "loading" if svc.engine_starting() else "unloaded")
                     model = {"id": svc.model, "object": "model",
-                             "status": {"value": "loaded" if loaded else "unloaded"},
+                             "status": {"value": value},
                              "meta": {"n_ctx": svc.engine.max_context},
                              # (the same capacity under the name generic OpenAI-compatible
                              # clients read on a model listing: DeepSeek Harness's pi-ai discovery,

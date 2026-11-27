@@ -2815,6 +2815,41 @@ class ModelManagement(unittest.TestCase):
         self.assertEqual((code, out["status"]["value"], self.engine.restarts, self.engine.running), (200, "loaded", 1, True))
         self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loaded")
 
+    def test_a_starting_engine_reports_loading_until_its_ready_line(self):
+        """A client that waits for the model (DGate's driver) polls GET /models and GET /health: with the engine
+        process up but its READY line not seen yet (max_context is still 0, from the spawn to the READY stdout
+        line) every status endpoint says "loading" (/health: 503), never "loaded"; once READY it says
+        "loaded" / 200."""
+        self.svc.model_management = True
+        self.engine.running, self.engine.max_context = True, 0     # the process exists, READY has not come
+        for path in ("/models", "/v1/models"):
+            data = self.call("GET", path)[1]["data"]
+            self.assertEqual([m["status"]["value"] for m in data], ["loading"], path)
+        code, out = self.call("GET", "/health")
+        self.assertEqual((code, out["status"]), (503, "loading"))
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loading")
+        self.engine.max_context = CTX                              # (the engine prints its READY <ctx> line)
+        for path in ("/models", "/v1/models"):
+            data = self.call("GET", path)[1]["data"]
+            self.assertEqual([m["status"]["value"] for m in data], ["loaded"], path)
+        self.assertEqual(self.call("GET", "/health")[0], 200)
+
+    def test_a_load_while_a_start_is_running_waits_for_it(self):
+        """A /models/load naming the running model while its start is still going waits for the start (the
+        start holds the engine) and answers only once it can serve - never "loaded" before READY."""
+        self.svc.model_management = True
+        self.engine.running, self.engine.max_context = True, 0     # the process is up, the load is going ...
+
+        def start():
+            time.sleep(0.3)                                        # ... no READY line yet
+            self.engine.max_context = CTX                          # ... its READY <ctx> line
+            self.svc.fifo.release()                                # ... and the start lets the engine go
+        self.svc.fifo.acquire()                                    # (ensure_engine's start holds the engine)
+        threading.Thread(target=start).start()
+        code, out = self.call("POST", "/models/load", {})
+        self.assertEqual((code, out["status"]["value"], self.engine.restarts), (200, "loaded", 0))
+        self.assertEqual(self.engine.max_context, CTX)             # (the answer came after the start, not during it)
+
     def test_load_names_the_running_model_by_its_config_and_starts_it(self):
         """A load naming the running model the way its config file is spelled (docker's /state names, MAYA_MODEL):
         it answers 200 and starts the engine - not a dropped connection."""
