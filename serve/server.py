@@ -3938,7 +3938,10 @@ class Service:
     def _restart_into(self, p: Path, why: str):
         _, port = getattr(self, "listen", None) or ("127.0.0.1", None)
         note = {"config": str(p.resolve()), "port": port, "why": why, "time": time.time()}
-        (self.models_root() / models.SWITCH_FILE).write_text(json.dumps(note), encoding="utf-8")
+        # (maya.py's folder, not the config's: after_server reads it from here once the server is gone - docker
+        #  keeps the configs in /state, and a note beside them would never be read, so the restart would land on
+        #  the model that ran before)
+        (ROOT / models.SWITCH_FILE).write_text(json.dumps(note), encoding="utf-8")
         self.model_restart = {"to": p.name, "why": why, "started": time.time()}
         threading.Thread(target=self._restart_for_models, args=(p.name, why), daemon=True).start()
 
@@ -6533,10 +6536,13 @@ def make_handler(svc: Service):
             if name != svc.model:
                 other = model_api.find_config(svc.models_root(), name)
                 if op == "load" and other is not None:    # another installed model: the swap (a load on request)
-                    self._mapi_target(name)
+                    if self._mapi_target(name):           # (True: the name is the model running now, another
+                        pass                              #  spelling of it - load it, as the bare load below does)
+                    else:
+                        return                            # (the answer went out: the swap's 503 + Retry-After)
+                else:
+                    self._json(404, {"error": {"message": "model not found"}})
                     return
-                self._json(404, {"error": {"message": "model not found"}})
-                return
             if op == "unload":
                 state = svc.unload()
                 if state == "busy":
@@ -7194,7 +7200,11 @@ def make_handler(svc: Service):
                                               ["text", "image", "video"] if isinstance(svc.vision, Vision) else
                                               ["text", "image"],
                                               "output_modalities": ["text"]}}
-                    self._json(200, {"object": "list", "data": [model] if loaded or svc.unloaded else []})
+                    # (the running model first, then the installed ones with the name /models/load loads: the
+                    #  always-on server lists what it can serve, not only what is in its memory now)
+                    others = [model_api.v1_installed_entry(m) for m in svc.model_listing() if not m["running"]] \
+                        if svc.config_path else []
+                    self._json(200, {"object": "list", "data": [model] + others})
             elif path == "/props":
                 if self._authorized():
                     self._props()

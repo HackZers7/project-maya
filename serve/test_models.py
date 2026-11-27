@@ -1195,7 +1195,9 @@ class Page(Served):
 
     def test_running_one_starts_again_with_its_new_settings(self):
         os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
-        with mock.patch.object(SV.os, "_exit") as ex, mock.patch.object(self.svc, "close_for_restart"):
+        # (the note goes to maya.py's ROOT - patched to this folder here, as maya.py's own tests patch theirs)
+        with mock.patch.object(SV.os, "_exit") as ex, mock.patch.object(self.svc, "close_for_restart"), \
+                mock.patch.object(SV, "ROOT", self.d):
             s, b = self.req("POST", "/api/models/settings", {"file": self.cfg.name, "settings": {"parallel": 2}})
             self.assertEqual((s, b["restarts"]), (202, True))
             for _ in range(50):
@@ -1215,7 +1217,8 @@ class Page(Served):
         self.assertGreater(self.other.stat().st_mtime, old + 900)            # (the next start picks it)
         self.assertFalse((self.d / M.SWITCH_FILE).exists())                   # (no restart: no note for maya.py)
         os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
-        with mock.patch.object(SV.os, "_exit") as ex, mock.patch.object(self.svc, "close_for_restart"):
+        with mock.patch.object(SV.os, "_exit") as ex, mock.patch.object(self.svc, "close_for_restart"), \
+                mock.patch.object(SV, "ROOT", self.d):
             s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
             for _ in range(50):
                 if ex.called:

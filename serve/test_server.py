@@ -2255,7 +2255,9 @@ class WebApp(unittest.TestCase):
             for path in ("/models", "/v1/models"):
                 code, _, body = self.get(path)
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body)["data"], [])
+                data = json.loads(body)["data"]            # (still listed: the model is installed, just not in memory)
+                self.assertEqual([m["id"] for m in data], [self.svc.model])
+                self.assertEqual([m["status"]["value"] for m in data], ["unloaded"])
             self.assertEqual(self.get("/props")[0], 503)
             self.assertEqual(json.loads(self.get("/slots")[2]), [])
         finally:
@@ -2812,6 +2814,24 @@ class ModelManagement(unittest.TestCase):
         code, out = self.call("POST", "/models/load", {"model": self.svc.model})
         self.assertEqual((code, out["status"]["value"], self.engine.restarts, self.engine.running), (200, "loaded", 1, True))
         self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loaded")
+
+    def test_load_names_the_running_model_by_its_config_and_starts_it(self):
+        """A load naming the running model the way its config file is spelled (docker's /state names, MAYA_MODEL):
+        it answers 200 and starts the engine - not a dropped connection."""
+        import tempfile
+        from serve import models as M
+        self.svc.model_management = True
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "maya-glm-5.3-flash.json"
+            cfg.write_text(json.dumps({"exe": "/b/maya", "args": ["--max-context", "32768"],
+                                       "model_name": "glm-5.3-flash"}))
+            self.svc.config_path = str(cfg)
+            self.engine.running = False                # (MAYA_START_UNLOADED's start, or after an idle unload)
+            with unittest.mock.patch.object(M, "machine_gpus", return_value=[]):
+                code, out = self.call("POST", "/models/load", {"model": "glm-5.3-flash"})
+        self.assertEqual(code, 200, out)
+        self.assertEqual(out["status"]["value"], "loaded", out)
+        self.assertEqual((self.engine.restarts, self.engine.running), (1, True))
 
     def test_unload_waits_for_a_running_request(self):
         self.svc.model_management = True

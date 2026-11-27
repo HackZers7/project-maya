@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve import model_api, model_pull  # noqa: E402
+from serve import model_api, model_pull, models as M, server as SV  # noqa: E402
 from serve.server import Service  # noqa: E402
 from serve.test_models import Served, glm_quant  # noqa: E402
 
@@ -75,6 +75,7 @@ class Api(Served):
         super().setUp()
         self.svc.model_management = True
         self.run_name = model_api.public_name(self.cfg)
+        self.other_name = model_api.public_name(self.other)
 
     def raw(self, method, path, body=None, headers=None):
         h = {"Content-Type": "application/json"}
@@ -187,6 +188,47 @@ class Api(Served):
             restart.assert_called_once()
             s, body, _ = self.raw("POST", "/models/load", {"model": other})   # (llama.cpp's load names it too)
         self.assertEqual(s, 503)
+
+    def test_v1_models_lists_the_installed_models(self):
+        """/v1/models: the running model as before (its id, its live context), then the installed ones under the
+        name /models/load loads - the always-on server lists what it can serve, not only what is in memory."""
+        s, b = self.req("GET", "/v1/models")
+        self.assertEqual((s, [m["id"] for m in b["data"]]), (200, [self.svc.model, "gguf-q8"]))
+        run, other = b["data"]
+        self.assertEqual((run["status"]["value"], run["meta"]["n_ctx"], run["context_length"]),
+                         ("loaded", self.svc.engine.max_context, self.svc.engine.max_context))
+        self.assertEqual((other["status"]["value"], other["maya"]["running"], other["maya"]["title"]),
+                         ("unloaded", False, "deepseek-v4.1-flash"))
+        self.assertEqual(other["context_length"], 65536)           # (the config's own --max-context)
+        s, b = self.req("GET", "/models")
+        self.assertEqual([m["id"] for m in b["data"]], [self.svc.model, "gguf-q8"])
+
+    def test_load_of_the_running_model_by_its_installed_name(self):
+        """/models/load naming the running model the way the configs are spelled (docker's /state names): an answer
+        (200, loaded) - the bare load's behavior, not a dropped connection.  The :latest spelling too."""
+        for name in (self.run_name, self.run_name + ":latest"):
+            s, b = self.req("POST", "/models/load", {"model": name})
+            self.assertEqual((s, b["status"]["value"]), (200, "loaded"), name)
+
+    def test_load_of_another_model_leaves_maya_its_note(self):
+        """/models/load for another installed model: the swap's 503 + Retry-After, and the note where maya.py
+        reads it - its ROOT (docker keeps the configs in /state, a note beside them is never read, and the
+        restart would land on the model that ran before)."""
+        os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
+        with tempfile.TemporaryDirectory() as note_root:
+            with mock.patch.object(SV.os, "_exit") as ex, \
+                    mock.patch.object(self.svc, "close_for_restart"), \
+                    mock.patch.object(SV, "ROOT", Path(note_root)):
+                s, body, h = self.raw("POST", "/models/load", {"model": self.other_name})
+                for _ in range(50):                    # (the restart thread's os._exit must run mocked: wait it out)
+                    if ex.called:
+                        break
+                    time.sleep(0.05)
+                note = json.loads((Path(note_root) / M.SWITCH_FILE).read_text())
+            self.assertEqual((s, h["Retry-After"]), (503, "30"))
+            self.assertIn("loading", json.loads(body))
+            self.assertEqual((note["why"], Path(note["config"]).name), ("switch", self.other.name))
+            ex.assert_called_once_with(SV.RESTART_EXIT)
 
     def test_delete_keeps_what_another_model_runs_from(self):
         l = glm_quant(self.d, "Maya-L")

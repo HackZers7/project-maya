@@ -80,6 +80,20 @@ def ps_entry(d: dict, expires_at, size_vram=0) -> dict:
     return out
 
 
+def v1_installed_entry(d: dict) -> dict:
+    """/v1/models: an installed model that is not the one running - its id the name /models/load accepts (the
+    config's maya-<name>.json as "<name>"), the model's own state beside it."""
+    ctx = int((d.get("settings") or {}).get("context") or 0)
+    out = {"id": public_name(Path(d["file"])).removeprefix("maya-"), "object": "model",
+           "status": {"value": "unloaded"},
+           "maya": {"title": d.get("model") or "", "ok": bool(d.get("ok")), "missing": d.get("missing"),
+                    "running": False}}
+    if ctx:
+        out["meta"] = {"n_ctx": ctx}
+        out["context_length"] = ctx
+    return out
+
+
 def show_entry(d: dict, plan: dict | None = None) -> dict:
     """/api/show: the model's settings and command, and (verbose) what a delete would remove."""
     s = d.get("settings") or {}
