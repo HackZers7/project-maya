@@ -57,6 +57,12 @@ DEFAULTS = {
     "MAYA_ABLATE": "off",                  # "on": the abliterated model (the vector is <GGUF tree>/vector/<file>);
                                            # "off": the stock model; anything else: a vector file's path to use
     "MAYA_IDLE_UNLOAD_S": "900",           # the model unloads itself after this many seconds without a request
+    "MAYA_MANAGE_ALLOW": "127.0.0.1",        # extra client IPs that may pull, delete and switch models without
+                                            # an API key, comma-separated. Loopback is already "this PC" for
+                                            # the gate, so the default bakes nothing: a rootless Docker sets
+                                            # 10.0.2.2 here (slirp4netns' address for the host - this PC's own
+                                            # requests arrive with that source); rootful Docker and bare
+                                            # metal never need it
     "MAYA_GLM_SLOT_KEEP": "1",             # "1": the conversation slots outlive the engine
     "MAYA_GLM_SLOTS": "16",                # conversations kept aside on the disk (the engine's default is 4)
     "MAYA_GLM_SLOT_GB": "64",              # their total size on disk, GB (the engine's 16)

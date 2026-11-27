@@ -3493,5 +3493,76 @@ class Ds4OneGpuSwitchNote(unittest.TestCase):
         self.assertIsNone(note({**self.CFG, "exe": "/x/maya-mm3"}, env))             # another model
 
 
+class ManageAllowSetting(unittest.TestCase):
+    """MAYA_MANAGE_ALLOW's parsing: the environment wins over the run config (as the sibling settings do), the value is
+    a comma-separated string - or a config list, as "api_key" may be - and blank parts are dropped."""
+
+    def test_env_wins_over_config(self):
+        from serve.server import manage_allow_setting
+        self.assertEqual(manage_allow_setting({"manage_allow": "10.0.0.1"}, {"MAYA_MANAGE_ALLOW": " 10.0.2.2 , 127.0.0.2 "}),
+                         ["10.0.2.2", "127.0.0.2"])
+
+    def test_config_string_and_list_and_default(self):
+        from serve.server import manage_allow_setting
+        self.assertEqual(manage_allow_setting({"manage_allow": "10.0.2.2,, 127.0.0.2 "}, {}), ["10.0.2.2", "127.0.0.2"])
+        self.assertEqual(manage_allow_setting({"manage_allow": ["10.0.2.2"]}, {}), ["10.0.2.2"])
+        self.assertEqual(manage_allow_setting({}, {}), [])
+        self.assertEqual(manage_allow_setting({}, {"MAYA_MANAGE_ALLOW": "  "}), [])
+
+
+class ManageGate(unittest.TestCase):
+    """The model API's manage ops (pull, delete, switch) without an API key: loopback only, plus MAYA_MANAGE_ALLOW -
+    the addresses that count as this PC's own. A rootless Docker's slirp4netns forwards this PC's requests into the
+    container with the source 10.0.2.2 (no loopback), so the loopback set alone shut the PC's own user out."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingEngine(tok, ANSWER, max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc.model_management = True
+        cls.svc.api_key = ""
+        cls.svc.manage_allow = ["127.0.0.2"]
+        cls.httpd = serve(cls.svc, host="0.0.0.0", port=0)
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, ip, headers=None):
+        """POST /api/delete from the source `ip` (127.0.0.2 is loopback to the kernel, but not to the gate)."""
+        c = http.client.HTTPConnection("127.0.0.2", self.port, source_address=(ip, 0), timeout=30)
+        c.request("POST", "/api/delete", json.dumps({"model": "no-such-model"}).encode(),
+                  {"Content-Type": "application/json", **(headers or {})})
+        r = c.getresponse()
+        out = r.status, json.loads(r.read())
+        c.close()
+        return out
+
+    def test_this_pcs_own_address_passes_with_maya_manage_allow(self):
+        # (the bug: under a rootless Docker the host's own requests arrive as 10.0.2.2 and were 403
+        #  "set an API key ...", though no key was ever part of the setup)
+        self.assertEqual(self.post("127.0.0.2"), (404, {"error": "model 'no-such-model' not found"}))
+
+    def test_loopback_passes_without_the_setting(self):
+        self.svc.manage_allow = []
+        self.addCleanup(setattr, self.svc, "manage_allow", ["127.0.0.2"])
+        self.assertEqual(self.post("127.0.0.1"), (404, {"error": "model 'no-such-model' not found"}))
+
+    def test_a_network_client_still_needs_the_setting(self):
+        self.svc.manage_allow = []
+        self.addCleanup(setattr, self.svc, "manage_allow", ["127.0.0.2"])
+        self.assertEqual(self.post("127.0.0.3"),
+                         (403, {"error": "set an API key to download, delete or switch models over the network"}))
+
+    def test_with_a_key_any_address_passes(self):
+        self.svc.api_key = "k"
+        self.addCleanup(setattr, self.svc, "api_key", "")
+        self.assertEqual(self.post("127.0.0.3", headers={"x-api-key": "k"}),
+                         (404, {"error": "model 'no-such-model' not found"}))
+
+
 if __name__ == "__main__":
     unittest.main()

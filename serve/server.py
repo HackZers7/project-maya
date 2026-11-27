@@ -808,6 +808,24 @@ def start_unloaded_setting(cfg: dict | None, env=None) -> bool:
     return bool((cfg or {}).get("start_unloaded"))
 
 
+LOCAL_MANAGE_IPS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")   # the manage gate's "this PC"
+
+
+def manage_allow_setting(cfg: dict | None, env=None) -> list:
+    """MAYA_MANAGE_ALLOW (or "manage_allow" in the run config): client IPs that count as this PC's own for the
+    model API's manage operations without an API key (pull, delete, switch - _mapi_gate), beside the loopback
+    ones. A comma-separated list. Under a rootless Docker every request from this PC arrives with the source
+    address 10.0.2.2 (slirp4netns' address for the host), and the loopback set alone would shut this PC's own
+    user out - the deployment sets that address (its compose); the image's own default bakes nothing."""
+    env = os.environ if env is None else env
+    v = maya_names.lookup(env, "MAYA_MANAGE_ALLOW")
+    if v is None or not str(v).strip():
+        v = (cfg or {}).get("manage_allow") or ""
+    if isinstance(v, (list, tuple)):                   # ("manage_allow": ["10.0.2.2"], as "api_key" may be a list)
+        v = ",".join(str(s) for s in v)
+    return [s.strip() for s in str(v).split(",") if s.strip()]
+
+
 def web_ui_setting(cfg: dict | None, env=None) -> bool:
     """Maya's web page (/, /web/*, /fonts/*): on unless the run config has "web_ui": false or MAYA_WEB_UI says 0 / off /
     false / no - an API-only server (#1089: a backend behind a proxy and another chat front end); the environment, when
@@ -6590,7 +6608,7 @@ def make_handler(svc: Service):
                 return False
             if manage and not svc.api_key:
                 ip = self.client_address[0] if self.client_address else ""
-                if ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                if ip not in LOCAL_MANAGE_IPS and ip not in getattr(svc, "manage_allow", ()):
                     self._json(403, {"error": "set an API key to download, delete or switch models over the network"})
                     return False
             return True
@@ -8608,6 +8626,7 @@ def main() -> int:
     svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
     if svc.model_management:
         print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
+    svc.manage_allow = manage_allow_setting(cfg)           # (keyless manage ops from these too: the deployment's slirp alias)
     svc.vision_loader = make_vision                     # None with the mock engine
     if start_unloaded:
         svc.unloaded = True
