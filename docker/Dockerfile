@@ -1,98 +1,84 @@
 # syntax=docker/dockerfile:1
 #
-# A Linux image of Project Maya built from one release: the engines compiled for a list of CUDA architectures,
-# the server and the pack builders, and the Python packages setup.py installs. docker/build.sh builds it from a
-# release's tree and checks it; docs/DOCKER.md says what it holds and what it doesn't.
+# A container image of Project Maya built from THIS repository: docker/build.sh drives it, taking the tree from
+# `git archive` of the ref it is asked for (default: this checkout's HEAD), so the working tree's dirt never
+# reaches the image and the image carries exactly a committed state. The commit it was built from is written into
+# .maya-image-ref by build.sh before the build and is logged by every start - the answer to "which version runs
+# here?". Everything a start would otherwise compile or download is built INTO the image here: Maya's Python
+# environment (.venv), llama.cpp's source, the engines (maya, maya-hy4) and the vision encoder - all through
+# Maya's own functions (docker/build.py), so a container start finds every stamp in place and compiles nothing.
+# The pack beside the model files is the only thing a first start still builds (it indexes the 90 GB of GGUF
+# files, which are mounted, not baked). What a start on OTHER GPUs than CUDA_ARCHS does: recompile into the
+# container - hence the devel base stays in the image, not a slim runtime one. The container start itself is
+# docker/start.py: the two models' configurations kept in /state and refreshed from MAYA_* at every start, the
+# server (with MAYA_START_UNLOADED=1, no model loaded) in a session of its own.
 #
-# It compiles the engines the way maya.py's setup does, with two differences:
-#   - MAYA_PORTABLE=ON: ggml's CPU code for an AVX2 baseline instead of the build machine's own CPU, so the image
-#     runs on CPUs without AVX-512 (Maya's own AVX-512 kernels are compiled per file and picked at run time anyway);
-#   - CMAKE_CUDA_ARCHITECTURES from CUDA_ARCHITECTURES (one cubin per architecture, plus its PTX) instead of the
-#     PC's own cards.
-# Text only: the vision encoder and the DFlash2 drafter are not built or fetched.
-
-# CUDA 13 builds sm_75 and newer; Volta (sm_70) needs CUDA 12 (docker/build.sh --cuda 12)
+# CUDA 13.0 builds for both this PC's cards (RTX 3090 = sm_86, RTX 5090 = sm_120; Maya needs 12.8+ for Blackwell)
+# and runs against the installed 615.x driver.
+#
+# The compile goes through Maya's own setup functions (docker/build.py -> maya.compile_engine), whose cmake
+# invocation ccache cannot be handed to the way an image built by a direct cmake call would pass it. ccache
+# applies anyway in its other form: it masquerades as the compilers (first on the PATH) and keeps its cache in a
+# BuildKit cache mount that outlives the build - a rebuild after a small source change recompiles only what the
+# change touched.
 ARG CUDA_VERSION=13.0.0
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
-ENV DEBIAN_FRONTEND=noninteractive
+# the GPU architectures the engine is compiled for at build time; rebuild with another CUDA_ARCHS to move the
+# image to other cards. MAYA_GPUS is only recorded in the build stamp
+ARG CUDA_ARCHS=86;120
+ARG MAYA_GPUS=0,1
+
+# maya.sh needs Python 3.10+ with venv and ensurepip; the engine build needs g++/make (build-essential); ccache
+# fronts the compilers (see the header); cmake and ninja come with Maya's own pip packages. The videos the server
+# reads sent like pictures (v1.1.29's video support) need the ffmpeg/ffprobe pair on the PATH: the server checks
+# for it, ffprobe times the video, the vision encoder reads its frames (MAYA_VIDEO_MAX_FRAMES, 4 a second)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates ccache cmake curl git ninja-build python3 unzip \
+        build-essential \
+        ccache \
+        python3 \
+        python3-venv \
+        python3-pip \
+        ca-certificates \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-# ccache in front of nvcc and the C/C++ compilers, its cache in a BuildKit cache mount that outlives the build: the
-# next release recompiles only the files whose inputs changed. The paths are fixed (/src, /build), so the hashes match
-# from one build to the next.
-ENV CCACHE_DIR=/root/.cache/ccache CCACHE_MAXSIZE=30G CCACHE_COMPILERCHECK=content
 
-ARG CUDA_ARCHITECTURES="75;80;86;89;120"
-# llama.cpp's source at the commit setup.py pins (LLAMA_CPP_COMMIT): ggml's CPU backend comes from it
-ARG LLAMA_CPP_COMMIT
-# empty: half the CPU threads, as maya.py does (nvcc takes 2-4 GB per job on the big kernels)
-ARG JOBS=""
+# ccache masquerades as the compilers it will be asked for: the engine's objects land in the cache mount of the
+# build below, keyed on the source's and the flags' bits. CCACHE_COMPILERCHECK=content: the key holds the
+# compiler's bits, not its (COPY-new) mtimes; CCACHE_PATH tells ccache where the real compilers live, so the
+# lookup never loops back to the symlinks
+ENV PATH="/usr/lib/ccache:${PATH}" \
+    CCACHE_DIR=/root/.cache/ccache \
+    CCACHE_MAXSIZE=30G \
+    CCACHE_COMPILERCHECK=content \
+    CCACHE_PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+# nvcc has no symlink in /usr/lib/ccache (CUDA is installed after ccache's package): add it
+RUN ln -s /usr/bin/ccache /usr/lib/ccache/nvcc
 
-COPY . /src
-RUN test -n "$LLAMA_CPP_COMMIT" \
-    && curl -fsSL -o /tmp/llama.zip "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.zip" \
-    && unzip -q /tmp/llama.zip -d /tmp \
-    && mv "/tmp/llama.cpp-${LLAMA_CPP_COMMIT}" /llama.cpp \
-    && rm /tmp/llama.zip
+# the tree as committed at the ref build.sh archived (no .git in an archive): the server (serve/server.py), the
+# image build (docker/build.py), the start (docker/start.py), the pack builders
+COPY . /opt/project-maya
 
-RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DMAYA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
-        -DMAYA_NATIVE_EXPERTS=ON -DMAYA_BUILD_TESTS=OFF -DMAYA_PORTABLE=ON \
-        -DMAYA_GGML_DIR=/llama.cpp \
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
-# The three engines: maya (GLM-5.3-Flash), maya-ds4 (DeepSeek-V4.1-Flash-1017) and maya-mm3 (MiniMax-M3.1-Flash).
-# The ccache statistics go to the build log.
+# the heavy layer: Maya's Python environment, llama.cpp's source, the engines and the vision encoder - the one
+# setup step build.py performs, in order (env, engine, vision, hy4). ccache's objects and pip's downloads live in
+# cache mounts that outlive the build
 RUN --mount=type=cache,id=project-maya-ccache,target=/root/.cache/ccache \
+    --mount=type=cache,id=project-maya-pip,target=/root/.cache/pip \
     ccache --zero-stats >/dev/null; \
-    jobs="${JOBS:-$(( $(nproc) / 2 ))}"; [ "$jobs" -ge 1 ] || jobs=1; \
-    for t in maya maya-ds4 maya-mm3; do cmake --build /build --target "$t" -j "$jobs" || exit 1; done; \
-    ccache --show-stats
-# The CPU settings and the CUDA architectures the tree was configured with, read from CMakeCache.txt for
-# docker/build.sh's checks
-RUN mkdir -p /out/bin && for t in maya maya-ds4 maya-mm3; do cp "/build/$t" "/out/bin/$t" || exit 1; done \
-    && grep -E '^(MAYA_PORTABLE|GGML_NATIVE|GGML_AVX[A-Z0-9_]*|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_AMX_[A-Z0-9_]*):' \
-         /build/CMakeCache.txt > /out/cpu-flags.txt \
-    && sed -n 's/^CMAKE_CUDA_ARCHITECTURES:[A-Z]*=//p' /build/CMakeCache.txt > /out/cuda-architectures.txt
+    CUDA_ARCHS="$CUDA_ARCHS" MAYA_GPUS="$MAYA_GPUS" python3 /opt/project-maya/docker/build.py; \
+    rc=$?; ccache --show-stats; exit $rc
 
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
-# MAYA_UPDATE_CHECK=0: the dashboard's self-update is a git fast-forward, which an image can't do
-ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 \
-    MAYA_UPDATE_CHECK=0
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates python3 python3-venv \
-    && rm -rf /var/lib/apt/lists/*
+# the engine's measured data, seeded into the mounted data/ folder at every start: the image's part (the expert
+# profiles and the seeds every load reads - the engine never measures them back) is copied aside here, so mounting
+# an empty data/ folder loses nothing. The per-PC measurements the engines write (the prompt routes, the CPU lane
+# timings) are NOT in the image: they land in the mount and survive a container recreate
+RUN cp -a /opt/project-maya/data /opt/project-maya/.maya-data-image
 
-# The release's files, less what only the tests, the benches and the HIP build use. The server (serve/server.py)
-# and the pack builders (tools/iq_pack.py, tools/ds4/pack_gguf.py, tools/mm3/pack_gguf.py) run from this tree.
-# data/glm5-synth.gguf (12 MB) stays: docker/build.sh packs it to check the pack builder works.
-COPY --from=build /src /opt/maya
-RUN rm -rf /opt/maya/.git /opt/maya/tests /opt/maya/bench /opt/maya/ref /opt/maya/third_party/wheels \
-           /opt/maya/data/glm5-*-dumps*
-# llama.cpp's gguf-py where setup.py puts it (tools/_paths.py looks there): the pack builders read the tokenizer with it
-COPY --from=build /llama.cpp/gguf-py /opt/maya/third_party/llama.cpp/gguf-py
-# setup.py's PY_PACKAGES, read from the release's own setup.py so a package a release adds reaches the image, less
-# cmake and ninja (build tools). The list and the versions pip took are kept in /opt/maya/image/.
-RUN mkdir -p /opt/maya/image && python3 - > /opt/maya/image/py-packages.txt <<'PY'
-import ast, re
-tree = ast.parse(open("/opt/maya/setup.py", encoding="utf-8").read())
-found = [node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
-         and any(isinstance(t, ast.Name) and t.id == "PY_PACKAGES" for t in node.targets)]
-assert len(found) == 1, "setup.py: expected one PY_PACKAGES list"
-packages = [p for p in ast.literal_eval(found[0])
-            if re.split(r"[<>=!~;\[ ]", p, maxsplit=1)[0].lower() not in ("cmake", "ninja")]
-assert "numpy" in packages, packages
-print("\n".join(packages))
-PY
-RUN python3 -m venv /opt/maya/.venv \
-    && /opt/maya/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/maya/.venv/bin/pip install --no-cache-dir -r /opt/maya/image/py-packages.txt \
-    && /opt/maya/.venv/bin/pip freeze > /opt/maya/image/pip-freeze.txt
-# the engines where maya.py's setup puts them: build/maya, build/maya-ds4, build/maya-mm3
-COPY --from=build /out/bin/ /opt/maya/build/
-COPY --from=build /out/cpu-flags.txt /out/cuda-architectures.txt /opt/maya/image/
+# the image is the source of truth: never check for a newer Maya from inside the container (update by building a
+# new ref: docker/build.sh, then docker compose up -d)
+ENV MAYA_UPDATE_CHECK=0
 
-WORKDIR /opt/maya
-# No entrypoint: the image serves a pack and a config made for it (docs/DOCKER.md, "Running it")
-CMD ["/opt/maya/.venv/bin/python", "/opt/maya/serve/server.py", "--help"]
+WORKDIR /opt/project-maya
+EXPOSE 8080
+
+ENTRYPOINT ["python3", "/opt/project-maya/docker/start.py"]

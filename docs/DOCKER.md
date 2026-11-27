@@ -1,5 +1,13 @@
 # A Docker image of Maya
 
+> **This fork builds from its own checkout.** [`docker/build.sh`](../docker/build.sh) here takes the tree from
+> `git archive` of the ref it is asked for (default: this checkout's HEAD) and builds
+> [`docker/Dockerfile`](../docker/Dockerfile) into this fork's image: the GLM ablation and the deferred start
+> (`MAYA_START_UNLOADED`) are in the source, `docker/build.py` performs the image build's one setup step and
+> `docker/start.py` starts the container. The page below is upstream's release-recipe documentation, kept for
+> reference; where this fork's recipe differs (no portable-CPU flags, the engines are `maya` and `maya-hy4`, the
+> tree lives in `/opt/project-maya`), the script's header says what its checks actually are.
+
 There is no official Maya image yet. This page is a recipe to build one from a release:
 [`docker/Dockerfile`](../docker/Dockerfile) and [`docker/build.sh`](../docker/build.sh), which builds the image, checks
 it and, if you ask, pushes it. Back to the [README](../README.md).
