@@ -277,7 +277,7 @@ def manage_glm(cfg: str) -> None:
     if a and a.lower() not in ("off", "no", "0", "false"):
         vec = a
         if a.lower() in ("on", "yes", "1", "true"):
-            vec = "/models/peasantsmith/GLM-5.3-Flash-Maya-GGUF/vector/glm53-refusal-per-block-3dir.layers45.f32"
+            vec = os.path.join(glm_root, "vector", "glm53-refusal-per-block-3dir.layers45.f32")
         if not os.path.isfile(vec):
             sys.exit(f"entrypoint: MAYA_ABLATE={a}: {vec} is not there - the engine would run the stock model "
                      "silently; put the vector in the models mount or set MAYA_ABLATE=off")

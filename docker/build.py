@@ -65,9 +65,11 @@ def archs_and_gpus() -> tuple[list[int], list[int]]:
     return archs, gpus
 
 
-def stage_engine() -> int:
-    """The GLM engine, through maya.compile_engine: the stamp it writes is what the runtime
-    setup reads - a start then reports the engine as already built and compiles nothing."""
+def _compile_engine(target: str, exe, label: str) -> int:
+    """The shared engine compile: the architectures and GPUs from the environment, llama.cpp's
+    source, the nvcc and Maya's own source hash - then maya.compile_engine for the target.
+    The stamp the last compile writes (build/MAYA-BUILD.json) is what the runtime setup reads:
+    a start then reports the engine as already built and compiles nothing."""
     import setup as S     # noqa: PLC0415
     import maya           # noqa: PLC0415
 
@@ -78,12 +80,19 @@ def stage_engine() -> int:
         print("build: no CUDA toolkit (nvcc) found in the image", file=sys.stderr)
         return 1
     src = S.source_hash(S.ENGINE_SOURCES)
-    meta = maya.compile_engine(archs, gpu_ids, nvcc, None, llama, src)
+    meta = maya.compile_engine(archs, gpu_ids, nvcc, None, llama, src, target=target)
     if meta is None:
-        print("build: the engine build failed (the reason is above)", file=sys.stderr)
+        print(f"build: the {label} engine build failed (the reason is above)", file=sys.stderr)
         return 1
-    print(f"build: engine built for {', '.join('sm_' + str(a) for a in meta['archs'])}: {maya.EXE}")
+    print(f"build: {label} built for {', '.join('sm_' + str(a) for a in meta['archs'])}: {exe}")
     return 0
+
+
+def stage_engine() -> int:
+    """The GLM engine (the `maya` target: GLM-5.3-Flash, GLM-5.3 and Qwen-3.8-Flash-Next)."""
+    import maya           # noqa: PLC0415  the built engine's path
+
+    return _compile_engine("maya", maya.EXE, "engine")
 
 
 def stage_vision() -> int:
@@ -113,22 +122,9 @@ def stage_hy4() -> int:
     """The Hy4-Flash engine beside the GLM one: the same build folder and stamp keep both
     targets ("maya", "maya-hy4"), so only its own sources compile here - a start finds it
     built instead of compiling maya-hy4 at every container recreation."""
-    import setup as S     # noqa: PLC0415
-    import maya           # noqa: PLC0415
+    import maya           # noqa: PLC0415  the built engine's path
 
-    archs, gpu_ids = archs_and_gpus()
-    llama = S.get_llama_cpp()
-    nvcc, _ = maya.find_nvcc(archs)
-    if nvcc is None:
-        print("build: no CUDA toolkit (nvcc) found in the image", file=sys.stderr)
-        return 1
-    src = S.source_hash(S.ENGINE_SOURCES)
-    meta = maya.compile_engine(archs, gpu_ids, nvcc, None, llama, src, target="maya-hy4")
-    if meta is None:
-        print("build: the maya-hy4 engine build failed (the reason is above)", file=sys.stderr)
-        return 1
-    print(f"build: maya-hy4 built for {', '.join('sm_' + str(a) for a in meta['archs'])}: {maya.HY4_EXE}")
-    return 0
+    return _compile_engine("maya-hy4", maya.HY4_EXE, "maya-hy4")
 
 
 STAGES = {"env": stage_env, "engine": stage_engine, "vision": stage_vision, "hy4": stage_hy4}
