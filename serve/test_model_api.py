@@ -20,8 +20,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import model_api, model_pull, models as M, server as SV  # noqa: E402
-from serve.server import Service  # noqa: E402
-from serve.test_models import Served, glm_quant  # noqa: E402
+from serve.server import MockEngine, Service  # noqa: E402
+from serve.test_models import Served, glm_quant, swap_parts  # noqa: E402
 
 
 class Pure(unittest.TestCase):
@@ -175,19 +175,24 @@ class Api(Served):
             self.assertEqual((s, b["done_reason"]), (200, "unload"))
             un.assert_called_once()
 
-    def test_swap_on_request(self):
-        other = model_api.public_name(self.other)
-        msg = [{"role": "user", "content": "hi"}]
-        s, b = self.req("POST", "/api/chat", {"model": other, "messages": msg})
-        self.assertEqual(s, 409)                                 # (not started by maya.sh: cannot switch itself)
-        os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
-        with mock.patch.object(Service, "_restart_into") as restart:
-            s, body, h = self.raw("POST", "/api/chat", {"model": other, "messages": msg})
-            self.assertEqual((s, h["Retry-After"]), (503, "30"))
-            self.assertIn("loading", json.loads(body))
-            restart.assert_called_once()
-            s, body, _ = self.raw("POST", "/models/load", {"model": other})   # (llama.cpp's load names it too)
-        self.assertEqual(s, 503)
+    def test_swap_errors_are_answered(self):
+        """A swap that cannot happen is a 409 in plain words - a chat's and a load's alike - and the model that ran
+        goes on.  (The switch itself no longer needs maya.sh or MAYA_RESTART_ON_UPDATE: it happens in this
+        process.)"""
+        broken = self.d / "maya-broken.json"
+        broken.write_text(json.dumps({"exe": "/b/maya", "args": ["--glm-pack", str(self.d / "nope" / "pack")],
+                                      "model_name": "broken"}))
+        self.svc.start_args = self.start_args()
+        why = (f"maya-broken.json cannot start: its model files are not on this PC ({self.d / 'nope'})"
+               " - run the setup again to repair it")
+        s, b = self.req("POST", "/api/chat", {"model": "broken", "stream": False,
+                                              "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual((s, b["error"]), (409, why))
+        s, b = self.req("POST", "/models/load", {"model": "broken"})
+        self.assertEqual((s, b["error"]), (409, why))
+        s, b = self.req("POST", "/api/chat", {"model": self.run_name, "stream": False,
+                                              "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200)                       # (the model that ran goes on)
 
     def test_v1_models_lists_the_installed_models(self):
         """/v1/models: the running model as before (its id, its live context), then the installed ones under the
@@ -210,25 +215,125 @@ class Api(Served):
             s, b = self.req("POST", "/models/load", {"model": name})
             self.assertEqual((s, b["status"]["value"]), (200, "loaded"), name)
 
-    def test_load_of_another_model_leaves_maya_its_note(self):
-        """/models/load for another installed model: the swap's 503 + Retry-After, and the note where maya.py
-        reads it - its ROOT (docker keeps the configs in /state, a note beside them is never read, and the
-        restart would land on the model that ran before)."""
-        os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
+    def start_args(self):
+        return argparse.Namespace(engine="maya", fit_max_tokens=False, idle_unload=None, api_key="", mcp_config=None)
+
+    def test_a_chat_naming_another_model_swaps_and_serves(self):
+        """llama.cpp's router behaviour: a chat naming another installed model swaps to it in this very request -
+        the answer comes back served by the model it named, the port never drops, and the Service's per-model state
+        is the new config's.  No 503, no retry."""
+        self.svc.start_args = self.start_args()
+        new = MockEngine(self.svc.tok, "</think>\n\nswapped", max_context=32768)
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", return_value=new):
+            s, b = self.req("POST", "/api/chat", {"model": self.other_name, "stream": False,
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["message"]["content"], "swapped")
+        self.assertIs(self.svc.engine, new)                        # (the new model runs here)
+        self.assertEqual(Path(self.svc.config_path).name, self.other.name)
+
+    def test_a_load_naming_another_model_is_accepted_and_swaps(self):
+        """llama.cpp's load: 200 {"success": true} at once, the swap runs in the background (the client watches
+        GET /models or /api/ps), and no note for maya.py - a switch does not restart the server any more."""
+        self.svc.start_args = self.start_args()
+        new = MockEngine(self.svc.tok, "</think>\n\nswapped", max_context=32768)
         with tempfile.TemporaryDirectory() as note_root:
-            with mock.patch.object(SV.os, "_exit") as ex, \
-                    mock.patch.object(self.svc, "close_for_restart"), \
+            with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                    mock.patch.object(SV, "maya_engine", return_value=new), \
                     mock.patch.object(SV, "ROOT", Path(note_root)):
-                s, body, h = self.raw("POST", "/models/load", {"model": self.other_name})
-                for _ in range(50):                    # (the restart thread's os._exit must run mocked: wait it out)
-                    if ex.called:
+                s, b = self.req("POST", "/models/load", {"model": self.other_name})
+                self.assertEqual((s, b), (200, {"success": True, "model": self.other_name + ":latest",
+                                                "status": {"value": "loading"}}))
+                for _ in range(100):                           # (the swap runs in a background thread: wait it out)
+                    if self.svc.engine is new and self.svc.model_restart is None:
                         break
-                    time.sleep(0.05)
-                note = json.loads((Path(note_root) / M.SWITCH_FILE).read_text())
-            self.assertEqual((s, h["Retry-After"]), (503, "30"))
-            self.assertIn("loading", json.loads(body))
-            self.assertEqual((note["why"], Path(note["config"]).name), ("switch", self.other.name))
-            ex.assert_called_once_with(SV.RESTART_EXIT)
+                    time.sleep(0.02)
+        self.assertIs(self.svc.engine, new)
+        self.assertEqual((self.svc.model_restart, Path(self.svc.config_path).name), (None, self.other.name))
+        self.assertFalse((Path(note_root) / M.SWITCH_FILE).exists())
+
+    def test_a_failed_swap_keeps_the_model_that_ran(self):
+        """A swap whose engine does not start is an error answer - the server goes on serving the model that ran,
+        it does not die with the swap."""
+        self.svc.start_args = self.start_args()
+        old = self.svc.engine
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", side_effect=RuntimeError("the engine did not start")):
+            s, b = self.req("POST", "/api/chat", {"model": self.other_name, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 503)
+        self.assertIn("the engine did not start", json.dumps(b))
+        self.assertIs(self.svc.engine, old)                        # (nothing replaced: the old model runs on)
+        s, b = self.req("POST", "/api/chat", {"model": self.run_name, "stream": False,
+                                              "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual((s, b["message"]["content"]), (200, "hello"))   # (and it serves)
+
+    def test_a_swap_to_a_config_the_server_cannot_serve_is_a_409(self):
+        """A config the switch's checks let through but the rebuild would raise on (a bad cors entry): the 409
+        comes before anything changes - the model that ran is untouched and serves."""
+        self.svc.start_args = self.start_args()
+        bad = self.d / "maya-badcors.json"
+        bad.write_text(json.dumps({"exe": "/b/maya",
+                                   "args": ["--glm-pack", str(self.d / "GLM-5.3-Flash" / "Maya-M" / "pack")],
+                                   "model_name": "badcors", "cors_origins": "http://127.0.0.1:8080"}))
+        old = self.svc.engine
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", return_value=MockEngine(self.svc.tok, "</think>\n\nx",
+                                                                             max_context=32768)):
+            s, b = self.req("POST", "/api/chat", {"model": "badcors", "stream": False,
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 409)
+        self.assertIn("cors_origins", json.dumps(b))
+        self.assertIs(self.svc.engine, old)                        # (nothing changed)
+        s, b = self.req("POST", "/api/chat", {"model": self.run_name, "stream": False,
+                                              "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual((s, b["message"]["content"]), (200, "hello"))   # (and it serves)
+
+    def test_a_swap_that_fails_while_rebuilding_puts_the_old_model_back(self):
+        """A failure in the middle of the rebuild (after the old engine was torn down and the new one spawned): the
+        new engine's memory is given back, the engine that ran is restarted, its state rebuilt from its config, and
+        the error reaches the answer - the model that ran serves again."""
+        self.svc.start_args = self.start_args()
+        real_remodel = Service.remodel
+        calls = []
+
+        class Restartable(MockEngine):
+            def restart(self):
+                calls.append("restart")
+        old = Restartable(self.svc.tok, "</think>\n\nhello", max_context=32768)
+        self.svc.engine = old
+
+        def flaky(s, *a, **k):
+            calls.append("remodel")
+            if len(calls) == 1:                            # (the first rebuild: the one that fails)
+                raise RuntimeError("the rebuild failed")
+            return real_remodel(s, *a, **k)
+        new = MockEngine(self.svc.tok, "</think>\n\nswapped", max_context=32768)
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", return_value=new), \
+                mock.patch.object(Service, "remodel", flaky):
+            s, b = self.req("POST", "/api/chat", {"model": self.other_name, "stream": False,
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(s, 503)
+        self.assertIn("the rebuild failed", json.dumps(b))
+        self.assertEqual(calls, ["remodel", "restart", "remodel"])   # (failed, the old engine back, its state's)
+        self.assertIs(self.svc.engine, old)                        # (the engine that ran is back)
+        self.assertEqual(Path(self.svc.config_path).name, self.cfg.name)   # (its state too)
+        s, b = self.req("POST", "/api/chat", {"model": self.run_name, "stream": False,
+                                              "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual((s, b["message"]["content"]), (200, "hello"))   # (and it serves)
+
+    def test_deleting_the_running_model_swaps_and_deletes_in_place(self):
+        """The running model's delete: the switch to `then` happens here (no restart), and the config and its files
+        are deleted right after - nothing of the deleted model is left running or on disk."""
+        self.svc.start_args = self.start_args()
+        new = MockEngine(self.svc.tok, "</think>\n\nswapped", max_context=32768)
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", return_value=new):
+            out = self.svc.delete_model(self.cfg.name, files=True, then=self.other.name)
+        self.assertEqual((out["deleting"], out["to"]), (self.cfg.name, self.other.name))
+        self.assertFalse(self.cfg.exists())                        # (deleted here, not by the next start)
+        self.assertIs(self.svc.engine, new)
 
     def test_delete_keeps_what_another_model_runs_from(self):
         l = glm_quant(self.d, "Maya-L")

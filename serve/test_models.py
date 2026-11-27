@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import argparse
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -26,6 +28,17 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 import serve.server as SV  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def swap_parts(svc, cfg, config: Path):
+    """maya_parts for the tests: the fixture's own tokenizer and template around the target config - the real one
+    wants a pack tokenizer the repo does not carry.  What is under test is the swap's orchestration."""
+    from types import SimpleNamespace
+    return SimpleNamespace(tok=svc.tok, template=svc.template, cfg=cfg, sampling_defaults={}, start_unloaded=False,
+                           mixed=None, make_vision=lambda eng: None, engine_env={}, config_path=str(config.resolve()),
+                           shared={}, shared_path=str(config) + ".shared",
+                           savings=SV.savings.Ledger(SV.savings.ledger_path(config), config.name,
+                                                     cfg.get("model_name") or "", ""))
 
 
 def glm_cfg(d: Path, name="maya-maya-m.json", **extra) -> Path:
@@ -1210,25 +1223,32 @@ class Page(Served):
                          ("settings", self.cfg.name, self.httpd.server_address[1]))
 
     def test_switch(self):
+        """The Models page's Switch: 202 at once, the swap in this process (no note for maya.py, no exit), the
+        config's recency marked so a start without --config picks it, and a second one while it runs is a 400."""
+        new = MockEngine(self.svc.tok, "</think>\n\nhello", max_context=32768)
+        gate = threading.Event()
+
+        def engine(c, p, defer=False):
+            gate.wait(5)
+            return new
+        self.svc.start_args = argparse.Namespace(engine="maya", fit_max_tokens=False, idle_unload=None,
+                                                 api_key="", mcp_config=None)
         old = time.time() - 1000
         os.utime(self.other, (old, old))
-        s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
-        self.assertEqual((s, b["to"], b["restarts"]), (202, self.other.name, False))
-        self.assertGreater(self.other.stat().st_mtime, old + 900)            # (the next start picks it)
-        self.assertFalse((self.d / M.SWITCH_FILE).exists())                   # (no restart: no note for maya.py)
-        os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
-        with mock.patch.object(SV.os, "_exit") as ex, mock.patch.object(self.svc, "close_for_restart"), \
-                mock.patch.object(SV, "ROOT", self.d):
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", side_effect=engine):
             s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
-            for _ in range(50):
-                if ex.called:
+            self.assertEqual((s, b["to"], b["restarts"]), (202, self.other.name, False))
+            self.assertGreater(self.other.stat().st_mtime, old + 900)            # (the next start picks it)
+            self.assertFalse((self.d / M.SWITCH_FILE).exists())                   # (no restart: no note for maya.py)
+            s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
+            self.assertEqual(s, 400)                                              # (a switch is already in flight)
+            gate.set()
+            for _ in range(100):                                                  # (the swap runs in the background)
+                if self.svc.engine is new and self.svc.model_restart is None:
                     break
-                time.sleep(0.05)
-        self.assertEqual((s, b["restarts"]), (202, True))
-        ex.assert_called_once_with(SV.RESTART_EXIT)
-        self.assertEqual(json.loads((self.d / M.SWITCH_FILE).read_text())["why"], "switch")
-        s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
-        self.assertEqual(s, 400)                                              # (already starting again)
+                time.sleep(0.02)
+        self.assertIs(self.svc.engine, new)                                       # (the other model runs here now)
 
     def test_switch_writes_the_models_own_defaults(self):
         """A switch to a config without its model's sampling and level (an older setup's), or with another model's,
@@ -1572,16 +1592,20 @@ class DeletePage(Served):
         for f in (self.cfg.name, "../maya-x.json", "maya-none.json", None):
             s, _ = self.req("POST", "/api/models/delete", {"file": f})
             self.assertEqual(s, 400, f)
-        # the running one with a model to switch to: only where Maya can start again by itself
-        s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "then": self.other.name})
+        # the running one without a model to switch to: refused - what would Maya run?
+        s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name})
         self.assertEqual(s, 400)
-        self.assertIn("cannot switch", b["error"]["message"])
+        self.assertIn("pick the model", b["error"]["message"])
         self.assertTrue(self.cfg.exists())
-        self.assertFalse((self.d / M.DELETE_FILE).exists())
 
     def test_the_running_one_after_a_switch(self):
-        os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
-        with mock.patch.object(Service, "_restart_into") as restart:
+        """The running one, deleted with a model to switch to: the swap happens here - no note, no next server -
+        and the config is deleted right after.  A dry run says what would go; deleting to itself is refused."""
+        new = MockEngine(self.svc.tok, "</think>\n\nhello", max_context=32768)
+        self.svc.start_args = argparse.Namespace(engine="maya", fit_max_tokens=False, idle_unload=None,
+                                                 api_key="", mcp_config=None)
+        with mock.patch.object(SV, "maya_parts", side_effect=lambda a, c, cf: swap_parts(self.svc, c, cf)), \
+                mock.patch.object(SV, "maya_engine", return_value=new):
             s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "dry_run": True})
             self.assertEqual((s, b["running"]), (200, True))
             s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name})       # (no model to switch to)
@@ -1591,15 +1615,18 @@ class DeletePage(Served):
             self.assertFalse((self.d / M.DELETE_FILE).exists())
             s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "then": self.other.name})
         self.assertEqual((s, b["deleting"], b["to"]), (202, self.cfg.name, self.other.name))
-        self.assertEqual(restart.call_args[0][0].name, self.other.name)
-        self.assertTrue(self.cfg.exists())                    # (it runs until the switch)
-        # the next server, on the other model: it deletes it, once
-        self.svc.config_path = str(self.other)
-        self.svc.finish_delete()
-        self.assertFalse(self.cfg.exists() or (self.d / M.DELETE_FILE).exists())
-        self.assertEqual((self.svc.deleted["deleted"], self.svc.deleted["model"]), (self.cfg.name, "glm-5.3-flash"))
+        self.assertFalse(self.cfg.exists())                   # (deleted here, once the other model runs)
+        self.assertIs(self.svc.engine, new)
         s, b = self.req("GET", "/api/models")
         self.assertEqual((b["deleted"]["deleted"], [m["file"] for m in b["models"]]), (self.cfg.name, [self.other.name]))
+        # a note an older server left (it deleted through the next start): cleaned up once
+        legacy = glm_quant(self.d, "Maya-L2")
+        (self.d / M.DELETE_FILE).write_text(json.dumps({"config": str(legacy), "files": False,
+                                                        "time": time.time(), "model": "glm-5.3-flash"}))
+        self.svc.config_path = str(self.other)
+        self.svc.finish_delete()
+        self.assertFalse(legacy.exists() or (self.d / M.DELETE_FILE).exists())
+        self.assertEqual((self.svc.deleted["deleted"], self.svc.deleted["model"]), (legacy.name, "glm-5.3-flash"))
 
     def test_a_switch_that_did_not_happen_deletes_nothing(self):
         note = {"config": str(self.cfg.resolve()), "files": True, "time": time.time()}

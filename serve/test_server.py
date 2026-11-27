@@ -2848,7 +2848,8 @@ class ModelManagement(unittest.TestCase):
         threading.Thread(target=start).start()
         code, out = self.call("POST", "/models/load", {})
         self.assertEqual((code, out["status"]["value"], self.engine.restarts), (200, "loaded", 0))
-        self.assertEqual(self.engine.max_context, CTX)             # (the answer came after the start, not during it)
+        self.assertEqual((code, out["success"]), (200, True))
+        self.assertEqual(self.engine.max_context, CTX)             # (the answer came after the start, not during it))
 
     def test_load_names_the_running_model_by_its_config_and_starts_it(self):
         """A load naming the running model the way its config file is spelled (docker's /state names, MAYA_MODEL):

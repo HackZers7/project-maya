@@ -205,9 +205,10 @@ class Rendering(_CleanToolOrders):
         self.assertIn("thinking_budget", str(e.exception.code))
         with self.assertRaises(SystemExit):
             server.checked_config_effort({"reasoning_effort": "4096"}, glm, True)
-        # main(): the check comes before the engine (the model's load) is started
+        # main(): the check (maya_parts calls it) comes before the engine (the model's load) is started (maya_engine)
         src = inspect.getsource(server.main)
-        self.assertLess(src.index("checked_config_effort("), src.index("StrataEngine("))
+        self.assertLess(src.index("maya_parts("), src.index("maya_engine("))
+        self.assertIn("checked_config_effort(", inspect.getsource(server.maya_parts))
 
     def test_thinking_disabled_omits_budget(self):
         for options in ({"reasoning_effort": "none"}, {"reasoning_effort": False},

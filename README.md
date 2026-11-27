@@ -305,8 +305,8 @@ slowest while the caches fill with what you use.
 - **In the browser:** chat (kept in your browser, with search, pins and folders, per-chat instructions and thinking
   level, edit and regenerate, HTML previews), a live **Monitor** of the model and your hardware (down to what fills
   each GPU's memory), a context size and port you can change in Settings, and **Models**: every model set up on this
-  machine, switching to another (Maya starts again with it) and each one's engine settings (context, GPUs, drafting,
-  images, memory), saved into its `maya-<model>.json`.
+  machine, switching to another (the model is replaced here, without dropping the API) and each one's engine settings
+  (context, GPUs, drafting, images, memory), saved into its `maya-<model>.json`.
 - **Models page:** the catalog lists every Maya model with its size. Download one with a progress bar, load it, unload
   the running one or delete one - no command line needed.
 - **Turbo:** one button beside the model's parameters sets the fastest settings for the model (greedy sampling, no

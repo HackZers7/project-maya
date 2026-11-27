@@ -47,6 +47,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import traceback
 import urllib.request
 import uuid
@@ -3188,7 +3189,14 @@ class Service:
         self.puller = None                               # serve/model_pull.py: the one model download (the Models page, /api/pull)
         self.unloaded = False                            # the engine was ended by the idle unload (not by a crash)
         self._engine_start = threading.Lock()            # ensure_engine: one start, also with --parallel's requests
+        self._switch_lock = threading.Lock()             # switch_model: the checks and the in-flight marker, one at a time
         self.updater = Updater(MAYA_VERSION)             # About > Updates: a newer release, and updating to it
+        self._derive_stop_state()
+
+    def _derive_stop_state(self):
+        """What the tokenizer and the chat template derive, once per model (the hot swap re-runs it for the new
+        one): the ids that end an answer server-side, the thinking markers, the literals."""
+        tokenizer, template = self.tok, self.template
         # The ids that end an answer server-side.  A string that is not a special token in this vocabulary
         # (GLM-5.3 has no <|im_end|>) encodes to its TEXT pieces, whose ids occur inside ordinary answers -
         # stopping on them would cut generation at any '<'.  Only single-token (real special) encodings count.
@@ -3392,6 +3400,125 @@ class Service:
             except Exception as e:  # noqa: BLE001 - ending anyway
                 print(f"[maya] stopping {type(part).__name__}: {e}", flush=True)
 
+    def remodel(self, a, cfg, parts, engine, vision, make_vision, unloaded: bool = False):
+        """Another model runs here now: everything per-model on this Service is re-read from `cfg` - the engine, the
+        tokenizer and the template (and the stop ids and the other things derived from them), the vision, the
+        sampling, the config's own settings and paths.  run() builds the first model through the very same call, so
+        the hot swap and the start keep one source of truth; `parts` (maya_parts) is None for the mock engine's
+        start, whose Service keeps what its constructor built.  The engine must be running (or deferred): the swap
+        spawns it before this."""
+        if parts is not None:
+            self.engine, self.tok, self.template = engine, parts.tok, parts.template
+            self.sampling_defaults = dict(parts.sampling_defaults or {})
+            self._derive_stop_state()
+        self.model = cfg.get("model_name", "qwen3.8-flash-next")
+        self.vision = vision
+        self.fit_max_tokens = a.fit_max_tokens or cfg.get("fit_max_tokens") is True
+        if cfg:   # (refusal ablation's reason when the model cannot have it: Qwen, the Mac engine - "not available")
+            self.ablate_why = models.ablate_choice(cfg).get("why") or ""
+        if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
+            self.fifo.set_capacity(engine.multi)
+            print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
+        if cfg.get("reasoning_effort") or (self.template.deepseek and cfg.get("reasoning_effort") is not None):
+            self.default_effort = cfg["reasoning_effort"]    # (checked before the load: checked_config_effort)
+            # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
+            level = (effort_name if self.template.minimax or getattr(self.template, "inkling", False) else effort_level)(
+                self.default_effort) or \
+                (f"{self.default_effort} of 100" if type(self.default_effort) is int
+                                                         else "none")
+            if getattr(self.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
+                level = QWEN_EFFORT.get(level, level)
+            if getattr(self.template, "hy4", False) or getattr(self.template, "ling", False):   # (Hy4-flash, Ling: none / high)
+                level = self.template.effort_shown(self.default_effort) or level
+            print(f"[maya] thinking level when a request names none: {level}"
+                  f"{'' if level in (self.default_effort, f'{self.default_effort} of 100') else f' (the config says {self.default_effort})'}",
+                  flush=True)
+        self.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
+                                maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else
+                                0 if getattr(self.template, "inkling", False) else 32768)         if self.has_think_budget else 0
+        self.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
+        # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
+        # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
+        self.think_budget_max = think_budget_at_max(self.template, cfg, self.think_budget)
+        if self.think_budget:
+            at_max = f", up to {self.think_budget_max} when a request asks for Max" \
+                if self.think_budget_max > self.think_budget else ""
+            print(f"[maya] thinking budget: {self.think_budget} tokens{at_max} (then the answer)", flush=True)
+        self.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
+        if self.model_management:
+            print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
+        self.manage_allow = manage_allow_setting(cfg)           # (keyless manage ops from these too: the deployment's slirp alias)
+        self.vision_loader = make_vision                     # None with the mock engine
+        self.unloaded = bool(unloaded)
+        if unloaded:
+            print("[maya] the model is not loaded at start (MAYA_START_UNLOADED): the first request or "
+                  "POST /models/load loads it", flush=True)
+        self.web_ui = web_ui_setting(cfg)                    # ("web_ui": false or MAYA_WEB_UI=0: the API only, #1089)
+        if not self.web_ui:
+            print("[maya] web page: off (\"web_ui\": false - /, /web/ and /fonts/ answer 404; the API as before)", flush=True)
+        self.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
+        if not self.loop_guard:
+            print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
+        self.api_key = a.api_key or cfg.get("api_key", "")
+        try:
+            self.cors_origins = parse_cors_origins(cfg.get("cors_origins"))
+        except ValueError as e:
+            raise ValueError(f"config: {e}") from None
+        if self.cors_origins:
+            print("[maya] browser pages allowed to call /v1/* (CORS): " + ", ".join(self.cors_origins), flush=True)
+        self.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
+        self.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+        self.backend = cfg.get("backend")                    # the Monitor's GPU reader: sysfs on AMD/HIP, NVML otherwise
+        if cfg.get("backend") == "hip":                      # (Windows: the Monitor finds the engine's cards with its hipInfo)
+            from serve import telemetry
+            telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
+        if getattr(self, "telemetry", None) is not None:     # (the sampler holds the cards it was built for: another
+            self.telemetry = None                            #  model may run on other ones - rebuilt, history and all)
+            self.start_telemetry()
+        self.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
+        two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
+        if (cfg.get("mixed_gpus_active") or two_gpus) and self.model_label:   # (the dashboard shows it: both GPUs on)
+            self.model_label += " · AMD + NVIDIA"
+        if parts is not None:
+            self.config_path = parts.config_path             # a context change from the dashboard is saved there
+            self.savings = parts.savings                     # the tokens it serves, and what its API would have charged
+        elif a.config:
+            self.config_path = str(Path(a.config).resolve())
+            p = Path(self.config_path)
+            self.savings = savings.Ledger(savings.ledger_path(p), p.name, self.model, models.quant_label(cfg, p))
+        args = [str(x) for x in cfg.get("args") or []]
+        self.model_dir, self.trained_context, self.dspark, self.lookup = None, None, None, None
+        tc_flags = ("--glm-pack", "--gguf", "--model", "-m") if models.family(cfg) == "ling" else ("--glm-pack", "--gguf")
+        flag = next((f for f in tc_flags if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack; Ling: --gguf/--model/-m)
+        if flag:                                            # the model's folder: the parent of the pack or GGUF file
+            target_p = Path(args[args.index(flag) + 1]).resolve()
+            self.model_dir = target_p.parent
+            tc_src = target_p if (models.family(cfg) == "ling" and target_p.is_file()) else self.model_dir
+            threading.Thread(target=lambda: setattr(self, "trained_context", trained_context(tc_src)),
+                             daemon=True).start()
+        elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
+            self.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
+            self.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent
+            # (DeepSeek's engine drafts unless --dspark off / none - "none" does not even load the blocks - when the pack
+            #  has them; MiniMax's says so itself, INFO dspark=)
+            if models.family(cfg) == "deepseek":
+                self.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
+                try:
+                    self.lookup = int(models.flag(args, "--suffix-draft", "3")) > 0
+                except ValueError:
+                    self.lookup = True
+        if parts is not None:                               # the Chat settings shared with other apps, from last time
+            self.shared_path, self.shared = parts.shared_path, parts.shared
+        elif a.config:
+            self.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+            try:
+                self.shared = clean_shared_defaults(json.loads(Path(self.shared_path).read_text(encoding="utf-8")))
+                if self.shared:
+                    print("[maya] other apps use the Chat settings: " +
+                          ", ".join(f"{k}={v}" for k, v in self.shared.items()), flush=True)
+            except (OSError, ValueError):
+                self.shared = {}
+
     def alone_reason(self, sampling: dict, pictures) -> str | None:
         """Two GPUs (serve/mixed_gpus.py): why this request runs on the AMD GPU alone - None: on both."""
         if not hasattr(self.engine, "use"):
@@ -3552,6 +3679,8 @@ class Service:
         """Reload the engine with an n-token context (the dashboard's Context size), on a thread: after the request in
         flight; new requests get a 503 meanwhile.  A start that fails (the context does not fit) puts the old one back;
         a good one is saved into the run config, so the next start keeps it."""
+        if getattr(self, "model_restart", None):
+            raise ValueError("Maya is switching models; try again when it is done")
         lim = self.context_limits()
         if not lim["min"] <= n <= lim["max"]:
             raise ValueError(f"the context must be between {lim['min']} and {lim['max']} tokens")
@@ -3835,36 +3964,176 @@ class Service:
         return {**self.turbo_info(), "restarting_now": restarts, "changed": out["changed"]}
 
     def switch_model(self, name) -> dict:
-        """The Models page's Switch: the config `name` becomes the most recently used one (a start without --config
-        picks it), and when maya.py started this server it ends with RESTART_EXIT after the request in flight, leaving
-        maya.py a note (models.SWITCH_FILE) to start that config, on this port."""
+        """The Models page's Switch, a /models/load naming another installed model: the config `name` becomes the
+        model running here.  The swap happens IN THIS PROCESS (Service._swap_run: the engine is replaced, everything
+        per-model rebuilt) - the port never drops, there is no exit and no note for maya.py.  This call starts the
+        swap in the background: the answer goes out at once, and GET /models, /api/ps say when the model is there
+        (model_restart says a switch is in flight).  The 200 is the acceptance: a background swap that fails never
+        reaches this answer - the status endpoints fall back to the model that ran, and the server log has the
+        reason.  A caller that will itself wait for the new model - a chat naming it, the delete-then-switch:
+        swap_now()."""
+        return self._switch(name, wait=False)
+
+    def swap_now(self, name) -> dict:
+        """The same switch, run here: the caller waits for the new model and goes on with it (a chat naming another
+        model serves its answer on it; the delete-then-switch deletes once it runs).  A failure raises - the model
+        that ran keeps serving, the server never dies with the swap."""
+        return self._switch(name, wait=True)
+
+    def _switch(self, name, wait: bool) -> dict:
+        """The checks and the in-flight marker, one at a time (a second switch while one runs is the busy 409, and
+        no reload or update lands across a switch), then the swap - in the caller's thread (wait) or a background
+        one."""
+        with self._switch_lock:
+            p, cfg = self._switch_check(name)
+            self.model_restart = {"to": p.name, "why": "switch", "started": time.time()}
+        if wait:
+            try:
+                self._swap_run(p, cfg)
+            finally:
+                self.model_restart = None
+            return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": False}
+
+        def run_swap():
+            try:
+                self._swap_run(p, cfg)
+            finally:
+                self.model_restart = None
+        threading.Thread(target=run_swap, daemon=True, name=f"maya-switch-{p.stem}").start()
+        return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": False}
+
+    def _switch_check(self, name) -> tuple[Path, dict]:
+        """The switch's checks, before anything changes: the config is one of this install's, is not the one
+        running, can start (its files are here), is servable (its cors, budget and idle settings parse - the
+        rebuild would raise on them), and Maya is not busy (a request's reload, an update, a switch or a restart
+        already in flight).  The model's own sampling and thinking level written into the config on the way (as
+        the setup writes them), and its recency marked (a start without --config picks it)."""
         p = self._model_path(name)
         if self._is_running(p):
             raise ValueError(f"{p.name} is the model running now")
         cfg = models.read(p)
-        why = models.missing(cfg)                        # (maya.py would stop at it: no model would run)
+        why = models.missing(cfg)                        # (no model would run from it)
         if why:
             raise ValueError(f"{p.name} cannot start: {why} - run the setup again to repair it")
         self._restart_busy()
+        parse_cors_origins(cfg.get("cors_origins"))      # (these three are what the rebuild would raise on: the
+        if cfg.get("thinking_budget") is not None:       #  swap's 409 here, before anything has changed)
+            int(cfg["thinking_budget"])
+        float(cfg.get("idle_unload_s") or 0)
         if models.own_defaults(p):                       # (its model's own sampling and level, as the setup writes)
             print(f"[maya] {p.name}: its model's own sampling and thinking level written into it", flush=True)
         os.utime(p)
-        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
-        if restarts:
-            self._restart_into(p, "switch")
-        print(f"[maya] {p.name} is the model to start" + (": Maya starts again with it" if restarts else
-              " next (a start without --config picks it)"), flush=True)
-        return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
+        return p, cfg
+
+    def _swap_run(self, p: Path, cfg: dict):
+        """The in-process replacement (model_restart says a switch is in flight; the checks are done): everything
+        the new model needs is built first, while the engine that ran still holds the GPUs - then all FIFO places
+        are held (the request in flight finishes, new ones wait), the old engine ends (its conversation saved on
+        QUIT, the GPU memory waited back), the new engine spawns and the Service's per-model state is rebuilt
+        around it (Service.remodel).  A failure at any of it - the spawn, the vision, the rebuild, the MCP servers -
+        puts the model that ran back (its engine restarted from its own spawn, its state rebuilt from its config)
+        and raises: the server keeps serving it, the error reaches the answer that asked for the swap."""
+        a = self.start_args
+        old_p = Path(self.config_path).resolve() if self.config_path else None
+        old_engine, was_unloaded = self.engine, self.unloaded
+        parts = maya_parts(a, cfg, p)                    # (a ValueError here: the 409, nothing has changed yet)
+        try:
+            new_hub = hub_from_config(cfg, a.mcp_config)
+        except SystemExit as e:                          # (a bad --mcp-config: the swap's 409, not the server's end)
+            raise ValueError(str(e).removeprefix("[maya] ")) from None
+        with self.fifo:                                  # every place: nothing runs or waits while the model changes
+            self._swap_teardown()
+            engine = vision = None
+            try:
+                engine = maya_engine(cfg, parts)         # (defer=False: a swap is itself a load request)
+                vision = parts.make_vision(engine)       # (the engine is loaded: its vision with it, whatever
+                                                         #  MAYA_START_UNLOADED says about the STARTS)
+                self.remodel(a, cfg, parts, engine, vision, parts.make_vision,
+                             unloaded=False)             # (and unloaded=False: the model is running now)
+                self._swap_hub(new_hub)
+            except Exception as e:
+                if vision is not None and hasattr(vision, "close"):   # (the new model's encoder, if it got built)
+                    try:
+                        vision.close()
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                if engine is not None:                   # (spawned: unwired, or wired halfway - its memory back)
+                    try:
+                        engine.close()
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                    pid = getattr(getattr(engine, "proc", None), "pid", None)
+                    if pid is not None:
+                        wait_gpu_release(pid)
+                self._swap_back(e, p.name, old_engine, old_p, was_unloaded)
+                raise
+            print(f"[maya] {p.name} is running", flush=True)
+
+    def _swap_teardown(self):
+        """The model that runs, ends for the swap (the caller holds every FIFO place): the engine gets QUIT (its
+        conversations are saved first), the GPU memory is waited back, the vision encoder ends with it."""
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        try:
+            self.engine.close()
+        except Exception as e:  # noqa: BLE001 - the swap goes on; the engine's pieces end best effort
+            print(f"[maya] the engine did not stop cleanly: {e}", flush=True)
+        if pid is not None:
+            wait_gpu_release(pid)
+        if self.vision is not None:
+            try:
+                if hasattr(self.vision, "close"):
+                    self.vision.close()
+            except Exception as e:  # noqa: BLE001 - the swap goes on
+                print(f"[maya] the vision encoder did not stop cleanly: {e}", flush=True)
+            self.vision = None
+
+    def _swap_back(self, why: Exception, name: str, old_engine, old_p: Path | None, was_unloaded: bool):
+        """The swap failed at any point after the teardown: the engine that ran is started again (its spawn is its
+        own) - or left unloaded, if that is how it was - and the Service's per-model state is rebuilt from its
+        config, whatever half of the new one the rebuild had already written.  If even that fails, the server stays
+        up and its requests say the engine is down (Service.ensure_engine tries it again per request)."""
+        print(f"[maya] the swap to {name} failed: {why} - the model that ran goes on", flush=True)
+        try:
+            self.engine = old_engine                     # (the Service runs it again, whatever the rebuild had set)
+            if not was_unloaded:
+                old_engine.restart()
+            old_cfg = models.read(old_p) if old_p is not None and old_p.is_file() else {}
+            old_parts = maya_parts(self.start_args, old_cfg, old_p) \
+                if old_p is not None and old_p.is_file() else None
+            old_vision = old_parts.make_vision(old_engine) \
+                if old_parts is not None and not was_unloaded else None
+            self.engine = old_engine                     # (the Service runs it again, whatever the rebuild had set)
+            self.remodel(self.start_args, old_cfg or {}, old_parts, old_engine, old_vision,
+                         old_parts.make_vision if old_parts is not None else None, unloaded=was_unloaded)
+            print("[maya] the engine is running again", flush=True)
+        except Exception as e:  # noqa: BLE001 - the server stays up; its requests try the engine again (ensure_engine)
+            print(f"[maya] and the model that ran did not come back cleanly: {e} - its next request tries once more",
+                  flush=True)
+
+    def _swap_hub(self, hub):
+        """The MCP servers are the config's own: the ones that ran end, the new config's start (none when it has
+        none)."""
+        if self.mcp is not None and hasattr(self.mcp, "close"):
+            try:
+                self.mcp.close()
+            except Exception as e:  # noqa: BLE001 - the swap goes on
+                print(f"[maya] the MCP servers did not stop cleanly: {e}", flush=True)
+        self.mcp = hub
+        if hub is not None:
+            print(f"[maya] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+                  f"chat: {', '.join(hub.servers)}", flush=True)
+            hub.start()
+            atexit.register(hub.close)                   # the servers Strata started end with it
 
     def delete_model(self, name, files: bool = False, dry_run: bool = False, then=None) -> dict:
         """The Models page's Delete: the config `name` off the list (models.delete), with `files` what its setup
-        downloaded for it as well.  Not while Maya starts again.  The model running: Maya switches to `then` first, and
-        the next server deletes it (models.DELETE_FILE) once the engine that ran from it is gone.  dry_run: what would
-        go (models.delete_plan), nothing deleted."""
+        downloaded for it as well.  Not while a switch is in flight.  The model running: Maya switches to `then`
+        first (here, in this process), and `p` is deleted right after - nothing of it runs any more.  dry_run: what
+        would go (models.delete_plan), nothing deleted."""
         p = self._model_path(name)
         running = self._is_running(p)
         if getattr(self, "model_restart", None):
-            raise ValueError("Maya is starting again; try again when it is done")
+            raise ValueError("Maya is switching models; try again when it is done")
         if dry_run:
             return {"file": p.name, "running": running, **models.delete_plan(self.models_root(), p)}
         if files and self.pull_slot().busy():            # (the download may be writing into the same folder)
@@ -3877,27 +4146,23 @@ class Service:
         return out
 
     def _delete_running(self, p: Path, files: bool, then) -> dict:
+        """The model running: the switch to `then` happens here (the engine that ran from `p` ends with it), and
+        `p` - its config and, with `files`, its files - is deleted right after, in this process.  A failure of the
+        swap raises: nothing is deleted, the model that ran goes on."""
         if not then:
             raise ValueError(f"{p.name} is the model running now: pick the model Maya switches to first")
-        if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
-            raise ValueError("this server was not started by maya.sh or START-MAYA.bat, so it cannot switch to another "
-                             f"model by itself: start another model, then delete {p.name}")
-        if files:                                        # (checked now: the next server only reports)
+        if files:                                        # (checked now: the delete says so before the swap)
             plan = models.delete_plan(self.models_root(), p)
             if not plan["ok"]:
                 raise ValueError(plan["why"])
-        cfg = models.read(p)                             # (its name, for the page once the config is gone)
-        note = self.models_root() / models.DELETE_FILE
-        note.write_text(json.dumps({"config": str(p.resolve()), "files": bool(files), "time": time.time(),
-                                    "model": cfg.get("model_name") or "", "quant": models.quant_label(cfg, p)}),
-                        encoding="utf-8")
-        try:
-            out = self.switch_model(then)                # (its checks: not this one, can start, not busy)
-        except BaseException:
-            note.unlink(missing_ok=True)
-            raise
-        print(f"[maya] {p.name} is deleted once {out['to']} runs" + (", with its files" if files else ""), flush=True)
-        return {"deleting": p.name, "to": out["to"], "files": bool(files), "restarts": True}
+        out = self.swap_now(then)                        # (its checks: not this one, can start, not busy)
+        cfg = models.read(p) or {}                       # (its name and quant, for the page's report)
+        deleted = models.delete(self.models_root(), p, bool(files))
+        self.deleted = {**deleted, "model": cfg.get("model_name") or "", "quant": models.quant_label(cfg, p),
+                        "time": time.time()}
+        print(f"[maya] {p.name} deleted" + (f", and its files ({deleted['freed'] / 2**30:.1f} GB)" if files else
+              " (its files stay)") + f" - {out['to']} runs", flush=True)
+        return {"deleting": p.name, "to": out["to"], "files": bool(files), "restarts": False}
 
     def finish_delete(self):
         """The model that ran before this start, deleted now that another one runs (the Models page deleted the
@@ -6570,8 +6835,8 @@ def make_handler(svc: Service):
                     if self._mapi_target(name):           # (True: the name is the model running now, another
                         pass                              #  spelling of it - load it, as the bare load below does)
                     else:
-                        return                            # (the answer went out: the swap's 503 + Retry-After)
-                else:
+                        return                            # (the answer went out: the 200 the load is accepted with,
+                else:                                     #  or the swap's 409 / 503)
                     self._json(404, {"error": {"message": "model not found"}})
                     return
             if op == "unload":
@@ -6584,7 +6849,7 @@ def make_handler(svc: Service):
                     self._json(200, {"model": name, "status": {"value": "unloaded"}})
                 return
             if svc.engine_ready():
-                self._json(200, {"model": name, "status": {"value": "loaded"}})
+                self._json(200, {"success": True, "model": name, "status": {"value": "loaded"}})
                 return
             if not svc.fifo.acquire(blocking=True):
                 self._json(503, {"error": {"message": "the engine has no free place to start"}})
@@ -6596,7 +6861,7 @@ def make_handler(svc: Service):
                 return
             finally:
                 svc.fifo.release()
-            self._json(200, {"model": name, "status": {"value": "loaded"}})
+            self._json(200, {"success": True, "model": name, "status": {"value": "loaded"}})
 
         # ------------------------------------------------------------ the model API (serve/model_api.py)
         def _mapi_gate(self, manage: bool = False) -> bool:
@@ -6726,9 +6991,13 @@ def make_handler(svc: Service):
             self.end_headers()
             self.answer_started = True
 
-        def _mapi_target(self, name) -> bool:
-            """The model a chat / generate names: True when it is the one running (or none named); otherwise the answer
-            is sent - 404, or the swap to that installed model (Maya starts again with it: a 503 + Retry-After says so)."""
+        def _mapi_target(self, name, swap_now: bool = False) -> bool:
+            """The model a chat / generate names: True when it is the one running (or none named) - the request is
+            served on it.  Another installed model: the swap to it, in this process (the port never drops).  A chat
+            / generate (swap_now) swaps here and is served by the model it named; a /models/load starts the swap in
+            the background and gets the 200 the load is accepted with - GET /models and /api/ps say when it is
+            there.  A swap that cannot happen (the config cannot start, Maya is busy) is a 409; one whose engine
+            failed is a 503 - the model that ran keeps serving."""
             run = next((m for m in svc.model_listing() if m["running"]), None)
             if not name or run is None:
                 return True
@@ -6740,32 +7009,24 @@ def make_handler(svc: Service):
                 return True
             if not self._mapi_gate(manage=True):
                 return False
-            if not getattr(svc, "model_restart", None):
-                if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
-                    self._json(409, {"error": f"{p.name} is installed, but this server was not started by maya.sh or "
-                                              "START-MAYA.bat, so it cannot switch models itself: start it with that model"})
-                    return False
-                try:
-                    svc.switch_model(p.name)
-                except ValueError as e:
-                    self._json(409, {"error": str(e)})
-                    return False
-            body = json.dumps({"error": f"loading model {model_api.public_name(p)}: Maya starts again with it (a big model "
-                                        "takes minutes); retry this request, GET /api/ps shows when it is loaded",
-                               "loading": model_api.public_name(p) + ":latest"}).encode()
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "30")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                if swap_now:
+                    svc.swap_now(p.name)                 # (this request waits for the new model, then runs on it)
+                    return True
+                svc.switch_model(p.name)                 # (the swap runs in the background)
+                self._json(200, {"success": True, "model": model_api.public_name(p) + ":latest",
+                                 "status": {"value": "loading"}})
+            except ValueError as e:
+                self._json(409, {"error": str(e)})
+            except Exception as e:  # noqa: BLE001 - the swap failed; the model that ran keeps serving
+                self._json(503, {"error": f"the swap to {model_api.public_name(p)} failed: {e}"})
             return False
 
         def _mapi_chat(self, kind: str, req: dict):
             """/api/chat and /api/generate through the same pipeline as /v1/chat/completions."""
             if not self._mapi_gate():
                 return
-            if not self._mapi_target(req.get("model")):
+            if not self._mapi_target(req.get("model"), swap_now=True):
                 return
             if kind == "chat":
                 check_messages(req)   # (the wrong shape: a ValueError, do_POST's 400)
@@ -8360,6 +8621,184 @@ def tee_server_log(path: str) -> None:
     sys.stdout = ServerLogTee(sys.stdout, handle)
 
 
+def maya_parts(a, cfg, config: Path):
+    """Everything one model's config builds for the server that is not the engine: the tokenizer, the chat template,
+    the sampling defaults, the vision plan and its factory, the savings ledger, the shared Chat settings.  The hot
+    swap rebuilds all of it for the new config while the engine that ran still holds the GPUs (maya_engine spawns
+    the new one); run() builds the first model's through here too, so both keep one source of truth.  ValueError
+    where the start would stop: a missing tokenizer, a reasoning_effort the model has not."""
+    tpath = Path(cfg.get("tokenizer") or a.tokenizer)
+    if a.engine == "maya" and not (tpath / "vocab.json").exists():
+        raise ValueError(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+    tok = ByteTokenizer()
+    if (tpath / "vocab.json").exists():
+        import strata_tokenizer as ST
+        tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
+    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
+    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
+    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
+    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
+    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.  Read before the load: it tells the model's family, by which
+    # the config's reasoning_effort is checked here, not after the minutes of loading (#807)
+    glm_dsa = glm_dsa_product.config_is_glm_dsa(cfg) or glm_dsa_product.pack_is_glm_dsa(tpath.parent)
+    template = ChatTemplate(chat_template_path(tpath), glm_dsa=glm_dsa)
+    if glm_dsa:
+        print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
+    try:
+        cfg = checked_config_effort(cfg, template, a.engine == "maya")
+    except SystemExit as e:                             # (a swap's 409, not the server's end)
+        raise ValueError(str(e).removeprefix("[maya] ")) from None
+    # GLM on an AMD APU with an NVIDIA card beside it ("mixed_gpus": true): the card leads, the APU helps
+    # (serve/glm_link.py; a config without the key starts as before)
+    cfg, link_line = glm_link.at_start(cfg)
+    if link_line:
+        print(link_line, flush=True)
+    env = child_env(cfg)
+    if note := ds4_one_gpu_switch_note(cfg, env):
+        print(note, flush=True)
+    sampling_defaults = sampling_defaults_from_config(cfg)
+    if "sampling" not in cfg:                           # (a config without them: the model's own, not none)
+        sampling_defaults = maya_quants.model_defaults(cfg)[0]
+    if models.ablate_default(cfg):                      # (refusal ablation on by default: the Models page's switch)
+        sampling_defaults = {**(sampling_defaults or {}), "ablate": True}
+    if sampling_defaults:
+        pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
+        print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
+              flush=True)
+    vcfg_in = cfg.get("vision") or None
+    vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg_in else None
+    # pictures: the encoder's environment, whether it runs on demand, and the engine's environment (one function,
+    # also the bench's: tools/maya_bench.py start_command)
+    vcfg, venv, on_demand, fp, engine_env = vision_plan(cfg, env, config.resolve().with_name("vision-memory.json"))
+    if on_demand:
+        print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
+              "image tokens", flush=True)
+    elif vcfg_in and vcfg_in.get("gpu") and vcfg and not vcfg.get("gpu"):
+        print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
+              flush=True)
+
+    def make_vision(eng):
+        """The vision for a running engine: the resident encoder, the wrapper of the engine's own tower, or the
+        on-demand wiring.  Runs at the start and again in Service.ensure_engine after a load that follows an
+        unload (MAYA_START_UNLOADED, the idle unload) - the encoder ends with the engine (Service.unload)."""
+        v = None
+        if vcfg and not on_demand:
+            print("loading the vision encoder ...", flush=True)
+            v = Vision(vcfg, log=vlog, env=venv)
+        if v is None and not vcfg and eng.info.get("vision") == "ds4":
+            # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
+            v = ds4_vision.Vision(ds4_vision.Geometry.from_info(eng.info),
+                                  picture_dir("maya-ds4-pictures-"), Vision.load)
+            room = eng.info.get("vision_room")
+            where = (f"{eng.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
+                     f"none between pictures, ~{eng.info.get('vision_room_mib')} MiB while one is read, lent by "
+                     + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
+            print(f"[maya] images: the model's vision tower runs in the engine (GPU {eng.info.get('vision_gpu')}: "
+                  f"{where}), up to {v.g.max_tokens} tokens a picture", flush=True)
+        elif v is None and not vcfg and eng.info.get("vision") == "ling":
+            v = ling_vision.Vision(ling_vision.Geometry.from_info(eng.info),
+                                   Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
+            where = (f"; no permanent VRAM (~{eng.info.get('vision_room_mib')} MiB lent while encoding)"
+                     if eng.info.get("vision_room") == "tail" else "")
+            print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {v.g.max_pixels} pixels "
+                  f"({v.g.max_tokens} tokens) a picture{where}", flush=True)
+        elif v is None and not vcfg and eng.info.get("vision") == "hy4":
+            # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
+            v = hy4_vision.Vision(hy4_vision.Geometry.from_info(eng.info),
+                                  picture_dir("maya-hy4-pictures-"), Vision.load)
+            # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
+            where = (f"; no VRAM kept for pictures (~{eng.info.get('vision_room_mib')} MiB while one is read, lent "
+                     "by the prompt buffers)" if eng.info.get("vision_room") == "chunk" else "")
+            print(f"[maya] images: the model's vision tower runs in the engine, up to {v.g.max_pixels} pixels "
+                  f"({v.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
+        elif v is None and not vcfg and eng.info.get("vision") == "mm3":
+            # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
+            v = mm3_vision.Vision(mm3_vision.Geometry.from_info(eng.info),
+                                  picture_dir("maya-mm3-pictures-"), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine, up to {v.g.max_pixels} pixels "
+                  f"({v.g.max_tokens} tokens) a picture", flush=True)
+        elif v is None and not vcfg and eng.info.get("vision") == "off":
+            # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
+            print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
+                  flush=True)
+        if on_demand:
+            lent = int(eng.info.get("vision_lend") or 0)
+            if lent > 0:
+                v = Vision(vcfg, log=vlog, env=venv, start=False)
+                v.lend = lambda: eng.command("VLEND", "VLENT")
+                v.reclaim = lambda: eng.command("VRECLAIM", "VRECLAIMED")
+                print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
+                      "the model lends it", flush=True)
+            elif models.family(cfg) == "ik2":
+                # Inkling 2 (maya-ik2 lends no memory, and its plan keeps none for pictures): the encoder starts when
+                # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
+                # the CPU - and ends once the request's pictures are read
+                need, gi = fp[1], (gpu_list(cfg) or [0])[0]
+                free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
+                v = Vision(vcfg, log=vlog, env=venv, start=False)
+                v.room = lambda: (free_of(gi) or 0) >= need
+                v.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
+                free = free_of(gi)
+                print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
+                      f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
+                      "no VRAM kept for it", flush=True)
+            else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
+                print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
+                      "runs on the CPU", flush=True)
+                v = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
+        return v
+
+    # the Chat settings shared with other apps, from last time (this config's file, beside it)
+    shared_path = str(config.with_suffix("")) + ".shared-settings.json"
+    try:
+        shared = clean_shared_defaults(json.loads(Path(shared_path).read_text(encoding="utf-8")))
+        if shared:
+            print("[maya] other apps use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items()),
+                  flush=True)
+    except (OSError, ValueError):
+        shared = {}
+    return SimpleNamespace(tok=tok, template=template, cfg=cfg, sampling_defaults=sampling_defaults,
+                           start_unloaded=start_unloaded_setting(cfg), mixed=mixed_gpus.config_of(cfg),
+                           make_vision=make_vision, engine_env=engine_env, config_path=str(config.resolve()),
+                           shared=shared, shared_path=shared_path,
+                           savings=savings.Ledger(savings.ledger_path(config), config.name,
+                                                  cfg.get("model_name", "qwen3.8-flash-next"),
+                                                  models.quant_label(cfg, config)))
+
+
+def maya_engine(cfg, parts, defer: bool = False):
+    """The config's engine, spawned (`defer`: no process yet - MAYA_START_UNLOADED's start; the first request or
+    POST /models/load starts it through restart()).  The hot swap spawns with defer=False: a swap is itself a load
+    request - the model it names loads, whatever MAYA_START_UNLOADED says."""
+    mixed = parts.mixed
+    if defer and mixed is not None:
+        print("[maya] MAYA_START_UNLOADED is not supported with mixed GPUs: the model loads at start", flush=True)
+        defer = False
+    t0 = time.time()
+    if defer:
+        # MAYA_START_UNLOADED: no engine process yet (defer) - the first request or /models/load starts it
+        # (Service.ensure_engine -> restart, which runs the full __init__ from the saved spawn); the vision
+        # encoder starts with it (make_vision, wired into the service as vision_loader)
+        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                              env=parts.engine_env, defer=True)
+    elif mixed is not None:
+        engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
+            cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=parts.engine_env, mixed=mixed)
+    else:
+        # (Hy4-Flash under Windows, a card whose CUDA share is not measured yet for this PC and driver: the engine
+        #  says at this start how much less free VRAM its choices hold with - the setup and the Models page count
+        #  the figure from then on; the start itself is the same)
+        room_card = models.hy4_room_due(cfg)
+        eargs = engine_args(cfg) + (["--room-report"] if room_card else [])
+        engine = StrataEngine(cfg["exe"], eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=parts.engine_env)
+        if room_card:
+            exe_, args_, *rest = engine.spawn             # (a start again: as without the flag)
+            engine.spawn = (exe_, [x for x in args_ if x != "--room-report"], *rest)
+            models.hy4_room_measured(cfg, room_card, engine.info)
+    engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
+    return engine
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "maya", "strata"], default="mock")   # (strata: the old name, kept for older scripts)
@@ -8420,17 +8859,13 @@ def main() -> int:
     except OSError:
         ap.error(f"port {a.port} is already in use - is Maya (or another server) already running? "
                  f"Close it, or start this one with a different --port")
-    if cfg.get("tokenizer"):
-        a.tokenizer = cfg["tokenizer"]
     for k_ in ("MAYA_PROMPT_MEMO", "MAYA_TURN_TRACE"):   # (the server's own keys, from the run's config; env_in renamed them)
         if isinstance(cfg.get("env"), dict) and maya_names.read_as(k_) in cfg["env"]:
             os.environ[k_] = str(cfg["env"][maya_names.read_as(k_)])
     globals()["TURN_TRACE"] = os.environ.get("MAYA_TURN_TRACE", "") not in ("", "0")
-    tok = ByteTokenizer()
-    tpath = Path(a.tokenizer)
-    if a.engine == "maya" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
+    tok = ByteTokenizer()                               # (the mock engine's; the maya engine's: maya_parts, per config)
+    tpath = Path(cfg.get("tokenizer") or a.tokenizer)
+    if a.engine != "maya" and (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
@@ -8445,145 +8880,28 @@ def main() -> int:
     if glm_dsa:
         print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
     cfg = checked_config_effort(cfg, template, a.engine == "maya")
-    two_gpus = False
     start_unloaded = False                  # MAYA_START_UNLOADED (the maya branch reads it from the env / config)
     make_vision = None                      # the maya branch's vision factory (Service.ensure_engine re-runs it)
+    parts = None                            # maya_parts' namespace (the hot swap rebuilds it for another config)
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
-        # GLM on an AMD APU with an NVIDIA card beside it ("mixed_gpus": true): the card leads, the APU helps
-        # (serve/glm_link.py; a config without the key starts as before)
-        cfg, link_line = glm_link.at_start(cfg)
-        if link_line:
-            print(link_line, flush=True)
-        vision = None
-        env = child_env(cfg)
-        if note := ds4_one_gpu_switch_note(cfg, env):
-            print(note, flush=True)
-        sampling_defaults = sampling_defaults_from_config(cfg)
-        if "sampling" not in cfg:                       # (a config without them: the model's own, not none)
-            sampling_defaults = maya_quants.model_defaults(cfg)[0]
-        if models.ablate_default(cfg):                  # (refusal ablation on by default: the Models page's switch)
-            sampling_defaults = {**(sampling_defaults or {}), "ablate": True}
-        if sampling_defaults:
-            pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
-                  flush=True)
-        start_unloaded = start_unloaded_setting(cfg)
-        vcfg_in = cfg.get("vision") or None
-        vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg_in else None
-        # pictures: the encoder's environment, whether it runs on demand, and the engine's environment (one function,
-        # also the bench's: tools/maya_bench.py start_command)
-        vcfg, venv, on_demand, fp, engine_env = vision_plan(cfg, env, Path(a.config).resolve().with_name("vision-memory.json"))
-        if on_demand:
-            print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
-                  "image tokens", flush=True)
-        elif vcfg_in and vcfg_in.get("gpu") and vcfg and not vcfg.get("gpu"):
-            print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
-                  flush=True)
+        try:
+            parts = maya_parts(a, cfg, Path(a.config).resolve())
+        except ValueError as e:
+            ap.error(str(e))
+        cfg = parts.cfg                                 # (glm_link's and checked_config_effort's words in it)
+        tok = parts.tok
+        sampling_defaults = parts.sampling_defaults
+        start_unloaded = parts.start_unloaded
         if not start_unloaded:
             print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1 and models.family(cfg) != "ik2":
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
-        t0 = time.time()
-        mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)
-        if start_unloaded and mixed is not None:
-            print("[maya] MAYA_START_UNLOADED is not supported with mixed GPUs: the model loads at start", flush=True)
-            start_unloaded = False
-        if start_unloaded:
-            # MAYA_START_UNLOADED: no engine process yet (defer) - the first request or /models/load starts it
-            # (Service.ensure_engine -> restart, which runs the full __init__ from the saved spawn); the vision
-            # encoder starts with it (make_vision below, wired into the service as vision_loader)
-            engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=engine_env, defer=True)
-        elif mixed is not None:
-            engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
-                cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
-        else:
-            # (Hy4-Flash under Windows, a card whose CUDA share is not measured yet for this PC and driver: the engine
-            #  says at this start how much less free VRAM its choices hold with - the setup and the Models page count
-            #  the figure from then on; the start itself is the same)
-            room_card = models.hy4_room_due(cfg)
-            eargs = engine_args(cfg) + (["--room-report"] if room_card else [])
-            engine = StrataEngine(cfg["exe"], eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
-            if room_card:
-                exe_, args_, *rest = engine.spawn             # (a start again: as without the flag)
-                engine.spawn = (exe_, [x for x in args_ if x != "--room-report"], *rest)
-                models.hy4_room_measured(cfg, room_card, engine.info)
-        engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
-        two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
+        engine = maya_engine(cfg, parts, defer=start_unloaded)
         if not start_unloaded:
             warn_tight_ram(engine.info.get("arena_mib"))
-        def make_vision(eng):
-            """The vision for a running engine: the resident encoder, the wrapper of the engine's own tower, or the
-            on-demand wiring.  Runs at the start and again in Service.ensure_engine after a load that follows an
-            unload (MAYA_START_UNLOADED, the idle unload) - the encoder ends with the engine (Service.unload)."""
-            v = None
-            if vcfg and not on_demand:
-                print("loading the vision encoder ...", flush=True)
-                v = Vision(vcfg, log=vlog, env=venv)
-            if v is None and not vcfg and eng.info.get("vision") == "ds4":
-                # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
-                v = ds4_vision.Vision(ds4_vision.Geometry.from_info(eng.info),
-                                      picture_dir("maya-ds4-pictures-"), Vision.load)
-                room = eng.info.get("vision_room")
-                where = (f"{eng.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
-                         f"none between pictures, ~{eng.info.get('vision_room_mib')} MiB while one is read, lent by "
-                         + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
-                print(f"[maya] images: the model's vision tower runs in the engine (GPU {eng.info.get('vision_gpu')}: "
-                      f"{where}), up to {v.g.max_tokens} tokens a picture", flush=True)
-            elif v is None and not vcfg and eng.info.get("vision") == "ling":
-                v = ling_vision.Vision(ling_vision.Geometry.from_info(eng.info),
-                                       Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
-                where = (f"; no permanent VRAM (~{eng.info.get('vision_room_mib')} MiB lent while encoding)"
-                         if eng.info.get("vision_room") == "tail" else "")
-                print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {v.g.max_pixels} pixels "
-                      f"({v.g.max_tokens} tokens) a picture{where}", flush=True)
-            elif v is None and not vcfg and eng.info.get("vision") == "hy4":
-                # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
-                v = hy4_vision.Vision(hy4_vision.Geometry.from_info(eng.info),
-                                      picture_dir("maya-hy4-pictures-"), Vision.load)
-                # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
-                where = (f"; no VRAM kept for pictures (~{eng.info.get('vision_room_mib')} MiB while one is read, lent "
-                         "by the prompt buffers)" if eng.info.get("vision_room") == "chunk" else "")
-                print(f"[maya] images: the model's vision tower runs in the engine, up to {v.g.max_pixels} pixels "
-                      f"({v.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
-            elif v is None and not vcfg and eng.info.get("vision") == "mm3":
-                # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
-                v = mm3_vision.Vision(mm3_vision.Geometry.from_info(eng.info),
-                                      picture_dir("maya-mm3-pictures-"), Vision.load)
-                print(f"[maya] images: the model's vision tower runs in the engine, up to {v.g.max_pixels} pixels "
-                      f"({v.g.max_tokens} tokens) a picture", flush=True)
-            elif v is None and not vcfg and eng.info.get("vision") == "off":
-                # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
-                print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
-                      flush=True)
-            if on_demand:
-                lent = int(eng.info.get("vision_lend") or 0)
-                if lent > 0:
-                    v = Vision(vcfg, log=vlog, env=venv, start=False)
-                    v.lend = lambda: eng.command("VLEND", "VLENT")
-                    v.reclaim = lambda: eng.command("VRECLAIM", "VRECLAIMED")
-                    print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
-                          "the model lends it", flush=True)
-                elif models.family(cfg) == "ik2":
-                    # Inkling 2 (maya-ik2 lends no memory, and its plan keeps none for pictures): the encoder starts when
-                    # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
-                    # the CPU - and ends once the request's pictures are read
-                    need, gi = fp[1], (gpu_list(cfg) or [0])[0]
-                    free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
-                    v = Vision(vcfg, log=vlog, env=venv, start=False)
-                    v.room = lambda: (free_of(gi) or 0) >= need
-                    v.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
-                    free = free_of(gi)
-                    print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
-                          f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
-                          "no VRAM kept for it", flush=True)
-                else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
-                    print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
-                          "runs on the CPU", flush=True)
-                    v = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
-            return v
+        make_vision = parts.make_vision
         vision = None if start_unloaded else make_vision(engine)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -8593,104 +8911,16 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
-    if cfg:   # (refusal ablation's reason when the model cannot have it: Qwen, the Mac engine - "not available")
-        svc.ablate_why = models.ablate_choice(cfg).get("why") or ""
-    if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
-        svc.fifo.set_capacity(engine.multi)
-        print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
-    if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
-        svc.default_effort = cfg["reasoning_effort"]    # (checked before the load: checked_config_effort)
-        # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
-        level = (effort_name if svc.template.minimax or getattr(svc.template, "inkling", False) else effort_level)(
-            svc.default_effort) or \
-            (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
-                                                     else "none")
-        if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
-            level = QWEN_EFFORT.get(level, level)
-        if getattr(svc.template, "hy4", False) or getattr(svc.template, "ling", False):   # (Hy4-flash, Ling: none / high)
-            level = svc.template.effort_shown(svc.default_effort) or level
-        print(f"[maya] thinking level when a request names none: {level}"
-              f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
-              flush=True)
-    svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
-                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else
-                           0 if getattr(svc.template, "inkling", False) else 32768)         if svc.has_think_budget else 0
-    svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
-    # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
-    # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
-    svc.think_budget_max = think_budget_at_max(svc.template, cfg, svc.think_budget)
-    if svc.think_budget:
-        at_max = f", up to {svc.think_budget_max} when a request asks for Max" \
-            if svc.think_budget_max > svc.think_budget else ""
-        print(f"[maya] thinking budget: {svc.think_budget} tokens{at_max} (then the answer)", flush=True)
-    svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
-    if svc.model_management:
-        print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
-    svc.manage_allow = manage_allow_setting(cfg)           # (keyless manage ops from these too: the deployment's slirp alias)
-    svc.vision_loader = make_vision                     # None with the mock engine
-    if start_unloaded:
-        svc.unloaded = True
-        print("[maya] the model is not loaded at start (MAYA_START_UNLOADED): the first request or "
-              "POST /models/load loads it", flush=True)
-    svc.web_ui = web_ui_setting(cfg)                    # ("web_ui": false or MAYA_WEB_UI=0: the API only, #1089)
-    if not svc.web_ui:
-        print("[maya] web page: off (\"web_ui\": false - /, /web/ and /fonts/ answer 404; the API as before)", flush=True)
-    svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
-    if not svc.loop_guard:
-        print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
-    svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.start_args = a                                  # the start's own arguments (the hot swap re-reads them)
     try:
-        svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))
+        svc.remodel(a, cfg, parts, engine, vision, make_vision, unloaded=start_unloaded)
     except ValueError as e:
-        raise SystemExit(f"config: {e}")
-    if svc.cors_origins:
-        print("[maya] browser pages allowed to call /v1/* (CORS): " + ", ".join(svc.cors_origins), flush=True)
-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
-    svc.backend = cfg.get("backend")                    # the Monitor's GPU reader: sysfs on AMD/HIP, NVML otherwise
-    if cfg.get("backend") == "hip":                      # (Windows: the Monitor finds the engine's cards with its hipInfo)
-        from serve import telemetry
-        telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
-    svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
-    if (cfg.get("mixed_gpus_active") or two_gpus) and svc.model_label:   # (the dashboard shows it: both GPUs on)
-        svc.model_label += " · AMD + NVIDIA"
-    if a.config:
-        svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
-        p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
-        svc.savings = savings.Ledger(savings.ledger_path(p), p.name, svc.model, models.quant_label(cfg, p))
-        threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
-        kept = jobs_load(p.parent / "answers")          # the web chat's answers of the last day survive a restart
+        raise SystemExit(str(e)) from None
+    if a.config:                                        # (start only: the model before, if the page deleted it)
+        threading.Thread(target=svc.finish_delete, daemon=True).start()
+        kept = jobs_load(Path(a.config).resolve().parent / "answers")   # the web chat's answers of the last day survive a restart
         if kept:
             print(f"[maya] {kept} web-chat answer(s) of the last day kept for the page (answers/)", flush=True)
-    args = [str(x) for x in cfg.get("args") or []]
-    tc_flags = ("--glm-pack", "--gguf", "--model", "-m") if models.family(cfg) == "ling" else ("--glm-pack", "--gguf")
-    flag = next((f for f in tc_flags if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack; Ling: --gguf/--model/-m)
-    if flag:                                            # the model's folder: the parent of the pack or GGUF file
-        target_p = Path(args[args.index(flag) + 1]).resolve()
-        svc.model_dir = target_p.parent
-        tc_src = target_p if (models.family(cfg) == "ling" and target_p.is_file()) else svc.model_dir
-        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(tc_src)),
-                         daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
-        svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
-        svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent
-        # (DeepSeek's engine drafts unless --dspark off / none - "none" does not even load the blocks - when the pack
-        #  has them; MiniMax's says so itself, INFO dspark=)
-        if models.family(cfg) == "deepseek":
-            svc.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
-            try:
-                svc.lookup = int(models.flag(args, "--suffix-draft", "3")) > 0
-            except ValueError:
-                svc.lookup = True
-    if a.config:                                        # the Chat settings shared with other apps, from last time
-        svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
-        try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
-            if svc.shared:
-                print("[maya] other apps use the Chat settings: " +
-                      ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
-        except (OSError, ValueError):
-            svc.shared = {}
     if hub is not None:
         import atexit
         svc.mcp = hub
