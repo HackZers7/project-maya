@@ -796,6 +796,18 @@ def model_management_setting(cfg: dict | None, env=None) -> bool:
     return bool(v) if v is not None else True
 
 
+def start_unloaded_setting(cfg: dict | None, env=None) -> bool:
+    """MAYA_START_UNLOADED (or "start_unloaded" in the run config): the server starts with the model unloaded -
+    no engine process, no vision encoder, the GPU and the RAM tier free - and the first request (or
+    /models/load) loads it (Service.ensure_engine); the environment, when set, wins over the config."""
+    on = ("1", "on", "true", "yes")
+    env = os.environ if env is None else env
+    v = maya_names.lookup(env, "MAYA_START_UNLOADED")
+    if v is not None and str(v).strip():
+        return str(v).strip().lower() in on
+    return bool((cfg or {}).get("start_unloaded"))
+
+
 def web_ui_setting(cfg: dict | None, env=None) -> bool:
     """Maya's web page (/, /web/*, /fonts/*): on unless the run config has "web_ui": false or MAYA_WEB_UI says 0 / off /
     false / no - an API-only server (#1089: a backend behind a proxy and another chat front end); the environment, when
@@ -1144,11 +1156,39 @@ class StrataEngine:
     multi = 0         # READY ... multi=<n> (set per start; the class default for engines built without __init__)
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None):
+                 env: dict | None = None, defer: bool = False):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
+        if defer:
+            # MAYA_START_UNLOADED: no process yet - the first request (or /models/load) starts the engine
+            # through restart(), which re-runs this __init__ from self.spawn without defer.  Everything
+            # restart() and the readers of a stopped engine touch is set here; ended=True makes alive()
+            # False, so the service treats the model as unloaded (as after Service.unload).
+            self.log = subprocess.DEVNULL
+            self.proc = None
+            self.max_context = 0
+            if "--max-context" in args[:-1]:            # the configured context, until READY reports the real one
+                self.max_context = int(args[args.index("--max-context") + 1])
+            self.can_stop = False
+            self.can_pause = False
+            self.multi = 0
+            self._routes = {}
+            self._routes_lock = threading.Lock()
+            self._rids = itertools.count(1)
+            self._tls = threading.local()
+            self._last = {}
+            self.info = {}
+            try:                             # a ready-made engine's BUILD.json says its version
+                self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+            except (OSError, ValueError):
+                self.info["version"] = None
+            self.vram = []
+            self.prefill_tok_s_mean = None
+            self.progress = None
+            self.ended = True
+            return
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
@@ -1417,12 +1457,14 @@ class StrataEngine:
 
     def restart(self):
         """Start the engine again (the same command) after it died; the new process has its own line queue."""
-        try:
-            self.proc.kill()
-            self.proc.wait(timeout=20)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        wait_gpu_release(self.proc.pid)
+        proc = getattr(self, "proc", None)              # None: never started (MAYA_START_UNLOADED)
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=20)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            wait_gpu_release(proc.pid)
         with self._routes_lock:                         # requests still waiting on the dead one: it is gone
             for q in self._routes.values():
                 q.put(None)
@@ -2096,6 +2138,9 @@ class StrataEngine:
     def close(self):
         """QUIT, then wait for the engine to end: with kept conversations (MAYA_GLM_SLOT_KEEP) it first writes the
         one it holds, so it gets MAYA_ENGINE_QUIT_S seconds (50; llama-swap's unloadTimeout should exceed it)."""
+        if getattr(self, "proc", None) is None:         # never started (MAYA_START_UNLOADED): nothing to end
+            self.ended = True
+            return
         wait = float(os.environ.get("MAYA_ENGINE_QUIT_S", "50") or 50)
         self._ask_end()
         try:
@@ -3365,6 +3410,12 @@ class Service:
                       "(a minute or two) ...", flush=True)
             self.engine.restart()
             self.unloaded = False
+            loader = getattr(self, "vision_loader", None)   # main's make_vision (MAYA_START_UNLOADED)
+            if self.vision is None and loader is not None:
+                try:
+                    self.vision = loader(self.engine)       # the encoder / the tower's wrapper start with the model
+                except Exception as e:  # noqa: BLE001 - the model runs; a picture request gets the reason
+                    print(f"[maya] the vision encoder did not start: {e}", flush=True)
             # the FIFO's places are the conversations the restarted engine reports: a start that came back with other
             # numbers (a different --parallel, no multi= at all) queued or over-admitted every request from here on
             places = max(1, int(getattr(self.engine, "multi", 0) or 1))
@@ -3396,6 +3447,14 @@ class Service:
             pid = getattr(getattr(self.engine, "proc", None), "pid", None)
             if pid is not None:
                 wait_gpu_release(pid)
+            if self.vision is not None:
+                # the vision encoder ends with the model (it starts again with it: ensure_engine's loader)
+                try:
+                    if hasattr(self.vision, "close"):
+                        self.vision.close()
+                except Exception as e:  # noqa: BLE001 - the model is unloaded either way
+                    print(f"[maya] the vision encoder did not stop cleanly: {e}", flush=True)
+                self.vision = None
             self.unloaded = True
             print(f"[maya] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''} (GPU memory and the "
                   "RAM tier given back); the next request loads it again", flush=True)
@@ -4353,6 +4412,12 @@ class Service:
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
         media = media_of(messages)
+        if media and self.vision is None:
+            # the model is unloaded (MAYA_START_UNLOADED or the idle unload): its vision - the encoder, or the
+            # engine's own tower - exists only while it runs, so load it before the text-only checks below decide
+            with self._turn([False, False], cancel, units=None):
+                self.ensure_engine()
+                self.engine_for("has pictures")
         if media and self.text_only() and getattr(self.template, "glm_dsa", False) and \
                 not media_of([m for m in messages if m.get("role") != "tool"]):
             # GLM-5.3 (glm-dsa, text only): pictures in tool results alone (an agent read an image file, a tool took a
@@ -7289,7 +7354,7 @@ def make_handler(svc: Service):
                     # file parts (OpenAI file / Responses input_file / Anthropic document): their text, or a
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
-                        path, "openai"), want_images=svc.vision is not None,
+                        path, "openai"), want_images=svc.vision is not None or getattr(svc, "vision_loader", None) is not None,
                         text_limit=text_file_limit(svc.engine.max_context),
                         **({"text_only": svc.text_only()} if svc.text_only() else {}))   # (GLM-5.3's words)
                 if path == "/v1/chat/completions":
@@ -7488,7 +7553,7 @@ def make_handler(svc: Service):
                                                                                  "application/pdf" else "file")
             # the same text-file cap health advertises (the page's own limit), and the same images flag: a model
             # without vision gets a clear error instead of pictures its request would drop
-            self._json(200, attach.extract(name, raw, want_images=svc.vision is not None,
+            self._json(200, attach.extract(name, raw, want_images=svc.vision is not None or getattr(svc, "vision_loader", None) is not None,
                                            text_limit=text_file_limit(svc.engine.max_context),
                                            **({"text_only": svc.text_only()} if svc.text_only() else {})))
 
@@ -8333,6 +8398,8 @@ def main() -> int:
         print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
     cfg = checked_config_effort(cfg, template, a.engine == "maya")
     two_gpus = False
+    start_unloaded = False                  # MAYA_START_UNLOADED (the maya branch reads it from the env / config)
+    make_vision = None                      # the maya branch's vision factory (Service.ensure_engine re-runs it)
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
@@ -8354,6 +8421,7 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
                   flush=True)
+        start_unloaded = start_unloaded_setting(cfg)
         vcfg_in = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg_in else None
         # pictures: the encoder's environment, whether it runs on demand, and the engine's environment (one function,
@@ -8365,15 +8433,22 @@ def main() -> int:
         elif vcfg_in and vcfg_in.get("gpu") and vcfg and not vcfg.get("gpu"):
             print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
                   flush=True)
-        if vcfg and not on_demand:
-            print("loading the vision encoder ...", flush=True)
-            vision = Vision(vcfg, log=vlog, env=venv)
-        print("loading the model (the first start takes a minute or two) ...", flush=True)
+        if not start_unloaded:
+            print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1 and models.family(cfg) != "ik2":
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
         mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)
-        if mixed is not None:
+        if start_unloaded and mixed is not None:
+            print("[maya] MAYA_START_UNLOADED is not supported with mixed GPUs: the model loads at start", flush=True)
+            start_unloaded = False
+        if start_unloaded:
+            # MAYA_START_UNLOADED: no engine process yet (defer) - the first request or /models/load starts it
+            # (Service.ensure_engine -> restart, which runs the full __init__ from the saved spawn); the vision
+            # encoder starts with it (make_vision below, wired into the service as vision_loader)
+            engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                                  env=engine_env, defer=True)
+        elif mixed is not None:
             engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
                 cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
         else:
@@ -8389,68 +8464,79 @@ def main() -> int:
                 models.hy4_room_measured(cfg, room_card, engine.info)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
-        warn_tight_ram(engine.info.get("arena_mib"))
-        if vision is None and not vcfg and engine.info.get("vision") == "ds4":
-            # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
-            vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
-                                       picture_dir("maya-ds4-pictures-"), Vision.load)
-            room = engine.info.get("vision_room")
-            where = (f"{engine.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
-                     f"none between pictures, ~{engine.info.get('vision_room_mib')} MiB while one is read, lent by "
-                     + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
-            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
-                  f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "ling":
-            vision = ling_vision.Vision(ling_vision.Geometry.from_info(engine.info),
-                                        Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
-            where = (f"; no permanent VRAM (~{engine.info.get('vision_room_mib')} MiB lent while encoding)"
-                     if engine.info.get("vision_room") == "tail" else "")
-            print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens) a picture{where}", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "hy4":
-            # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
-            vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
-                                       picture_dir("maya-hy4-pictures-"), Vision.load)
-            # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
-            where = (f"; no VRAM kept for pictures (~{engine.info.get('vision_room_mib')} MiB while one is read, lent "
-                     "by the prompt buffers)" if engine.info.get("vision_room") == "chunk" else "")
-            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
-            # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
-            vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
-                                       picture_dir("maya-mm3-pictures-"), Vision.load)
-            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens) a picture", flush=True)
-        elif vision is None and not vcfg and engine.info.get("vision") == "off":
-            # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
-            print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
-                  flush=True)
-        if on_demand:
-            lent = int(engine.info.get("vision_lend") or 0)
-            if lent > 0:
-                vision = Vision(vcfg, log=vlog, env=venv, start=False)
-                vision.lend = lambda: engine.command("VLEND", "VLENT")
-                vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
-                print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
-                      "the model lends it", flush=True)
-            elif models.family(cfg) == "ik2":
-                # Inkling 2 (maya-ik2 lends no memory, and its plan keeps none for pictures): the encoder starts when
-                # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
-                # the CPU - and ends once the request's pictures are read
-                need, gi = fp[1], (gpu_list(cfg) or [0])[0]
-                free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
-                vision = Vision(vcfg, log=vlog, env=venv, start=False)
-                vision.room = lambda: (free_of(gi) or 0) >= need
-                vision.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
-                free = free_of(gi)
-                print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
-                      f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
-                      "no VRAM kept for it", flush=True)
-            else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
-                print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
-                      "runs on the CPU", flush=True)
-                vision = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
+        if not start_unloaded:
+            warn_tight_ram(engine.info.get("arena_mib"))
+        def make_vision(eng):
+            """The vision for a running engine: the resident encoder, the wrapper of the engine's own tower, or the
+            on-demand wiring.  Runs at the start and again in Service.ensure_engine after a load that follows an
+            unload (MAYA_START_UNLOADED, the idle unload) - the encoder ends with the engine (Service.unload)."""
+            v = None
+            if vcfg and not on_demand:
+                print("loading the vision encoder ...", flush=True)
+                v = Vision(vcfg, log=vlog, env=venv)
+            if v is None and not vcfg and eng.info.get("vision") == "ds4":
+                # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
+                v = ds4_vision.Vision(ds4_vision.Geometry.from_info(eng.info),
+                                      picture_dir("maya-ds4-pictures-"), Vision.load)
+                room = eng.info.get("vision_room")
+                where = (f"{eng.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
+                         f"none between pictures, ~{eng.info.get('vision_room_mib')} MiB while one is read, lent by "
+                         + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
+                print(f"[maya] images: the model's vision tower runs in the engine (GPU {eng.info.get('vision_gpu')}: "
+                      f"{where}), up to {v.g.max_tokens} tokens a picture", flush=True)
+            elif v is None and not vcfg and eng.info.get("vision") == "ling":
+                v = ling_vision.Vision(ling_vision.Geometry.from_info(eng.info),
+                                       Path(tempfile.mkdtemp(prefix="maya-ling-pictures-")), Vision.load)
+                where = (f"; no permanent VRAM (~{eng.info.get('vision_room_mib')} MiB lent while encoding)"
+                         if eng.info.get("vision_room") == "tail" else "")
+                print(f"[maya] images: Ling-3.2-air vision tower runs in the engine, up to {v.g.max_pixels} pixels "
+                      f"({v.g.max_tokens} tokens) a picture{where}", flush=True)
+            elif v is None and not vcfg and eng.info.get("vision") == "hy4":
+                # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
+                v = hy4_vision.Vision(hy4_vision.Geometry.from_info(eng.info),
+                                      picture_dir("maya-hy4-pictures-"), Vision.load)
+                # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
+                where = (f"; no VRAM kept for pictures (~{eng.info.get('vision_room_mib')} MiB while one is read, lent "
+                         "by the prompt buffers)" if eng.info.get("vision_room") == "chunk" else "")
+                print(f"[maya] images: the model's vision tower runs in the engine, up to {v.g.max_pixels} pixels "
+                      f"({v.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
+            elif v is None and not vcfg and eng.info.get("vision") == "mm3":
+                # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
+                v = mm3_vision.Vision(mm3_vision.Geometry.from_info(eng.info),
+                                      picture_dir("maya-mm3-pictures-"), Vision.load)
+                print(f"[maya] images: the model's vision tower runs in the engine, up to {v.g.max_pixels} pixels "
+                      f"({v.g.max_tokens} tokens) a picture", flush=True)
+            elif v is None and not vcfg and eng.info.get("vision") == "off":
+                # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
+                print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
+                      flush=True)
+            if on_demand:
+                lent = int(eng.info.get("vision_lend") or 0)
+                if lent > 0:
+                    v = Vision(vcfg, log=vlog, env=venv, start=False)
+                    v.lend = lambda: eng.command("VLEND", "VLENT")
+                    v.reclaim = lambda: eng.command("VRECLAIM", "VRECLAIMED")
+                    print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
+                          "the model lends it", flush=True)
+                elif models.family(cfg) == "ik2":
+                    # Inkling 2 (maya-ik2 lends no memory, and its plan keeps none for pictures): the encoder starts when
+                    # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
+                    # the CPU - and ends once the request's pictures are read
+                    need, gi = fp[1], (gpu_list(cfg) or [0])[0]
+                    free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
+                    v = Vision(vcfg, log=vlog, env=venv, start=False)
+                    v.room = lambda: (free_of(gi) or 0) >= need
+                    v.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
+                    free = free_of(gi)
+                    print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
+                          f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
+                          "no VRAM kept for it", flush=True)
+                else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
+                    print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
+                          "runs on the CPU", flush=True)
+                    v = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
+            return v
+        vision = None if start_unloaded else make_vision(engine)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
@@ -8492,6 +8578,11 @@ def main() -> int:
     svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
     if svc.model_management:
         print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
+    svc.vision_loader = make_vision                     # None with the mock engine
+    if start_unloaded:
+        svc.unloaded = True
+        print("[maya] the model is not loaded at start (MAYA_START_UNLOADED): the first request or "
+              "POST /models/load loads it", flush=True)
     svc.web_ui = web_ui_setting(cfg)                    # ("web_ui": false or MAYA_WEB_UI=0: the API only, #1089)
     if not svc.web_ui:
         print("[maya] web page: off (\"web_ui\": false - /, /web/ and /fonts/ answer 404; the API as before)", flush=True)
@@ -8621,8 +8712,8 @@ def main() -> int:
                     pass
         if hasattr(engine, "close"):
             engine.close()
-        if vision:
-            vision.close()
+        if svc.vision is not None:                      # (the live one: a load after the start made its own)
+            svc.vision.close()
         if hub is not None:
             hub.close()
     except KeyboardInterrupt:                          # a second Ctrl+C: at once
