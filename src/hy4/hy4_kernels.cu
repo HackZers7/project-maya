@@ -2,6 +2,7 @@
 // CUDA cores, the latent cache in F16 as the reference keeps it; the reference is AngelSlim's hy4-flash graph
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
+#include "hy4_ablate.cuh"
 #include "maya/kernels/fresh_load.hpp"
 #include "maya/kernels/lane_xor.hpp"   // warp sums in registers on RDNA
 #include "maya/kernels/rdna_wmma.hpp"
@@ -781,6 +782,20 @@ __global__ void hc_post_kernel(float* __restrict__ x, int hc, int E, const float
     if (i >= total) return;
     const size_t t = i / ((size_t) hc * E), s = (i / E) % hc, d = i % E;
     x[i] += y[t * E + d] * post[t * hc + s];
+}
+
+// HY4_ABLATE: x[t][s] -= scale * sum_j (x[t][s] . v_sj) v_sj over the k orthonormal rows v_s of stream s (grid
+// (rows, hc), 256 threads; V already at the point's rows: [hc][k][E])
+__global__ void hc_ablate_kernel(float* __restrict__ X, const float* __restrict__ V, int k, int E, float scale) {
+    float* x = X + ((size_t) blockIdx.x * gridDim.y + blockIdx.y) * E;
+    const float* v = V + (size_t) blockIdx.y * k * E;
+    for (int j = 0; j < k; ++j, v += E) {
+        float d = 0.0f;
+        for (int i = threadIdx.x; i < E; i += blockDim.x) d += x[i] * v[i];
+        d = block_sum(d) * scale;
+        for (int i = threadIdx.x; i < E; i += blockDim.x) x[i] -= d * v[i];
+        __syncthreads();
+    }
 }
 
 // ---------------------------------------------------------------- RoPE (NORM: consecutive pairs)
@@ -3143,6 +3158,14 @@ void hc_post_norm(float* x, int T, int hc, int E, const float* y, const float* p
     }
     hc_post_norm_kernel<<<dim3(kPostBlocks, (unsigned) T), 256, 0, s>>>(x, hc, E, y, post, w, eps, yo);
     check("hc_post_norm");
+}
+void hc_ablate(float* x, int T, int hc, int E, int point, cudaStream_t s) {
+    if (!hy4_ablate::on() || T <= 0) return;
+    const float* v = hy4_ablate::vec(point);
+    if (v == nullptr) return;
+    const hy4_ablate::State& a = hy4_ablate::state();
+    hc_ablate_kernel<<<dim3((unsigned) T, (unsigned) hc), 256, 0, s>>>(x, v, a.k, E, a.scale);
+    check("hc_ablate");
 }
 bool rope_q8_copy(float* q, int T, int H, int k, int nope, int n_rot, const int* pos, float base, float* qcat, size_t ldq,
                   int kl, Q8Out q8, cudaStream_t s) {

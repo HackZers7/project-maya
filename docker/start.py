@@ -68,6 +68,9 @@ DEFAULTS = {
     "MAYA_PARALLEL": "1",                  # how many requests decode at once (1-8): a maya.py switch
     "MAYA_ABLATE": "off",                  # "on": the abliterated model (the vector is <GGUF tree>/vector/<file>);
                                            # "off": the stock model; anything else: a vector file's path to use
+    "MAYA_HY4_ABLATE": "off",              # Hy4-Flash: "on": the refusal directions projected out of the streams
+                                           # (the vector is the model folder's Hy4-flash-refusal-directions.bin);
+                                           # "off": the stock model; anything else: a vector file's path to use
     "MAYA_IDLE_UNLOAD_S": "900",           # the model unloads itself after this many seconds without a request
     "MAYA_MANAGE_ALLOW": "127.0.0.1",        # extra client IPs that may pull, delete and switch models without
                                             # an API key, comma-separated. Loopback is already "this PC" for
@@ -205,12 +208,30 @@ def manage_hy4(cfg: str) -> None:
     # the shared MAYA_PREFILL while it is unset; auto: the engine's plan picks it, 4096 a
     # step here; a number sets it, and the chunk's staged rows sit in RAM in proportion to
     # it). idle_unload_s is the inactivity timeout after
-    # which the model unloads itself (MAYA_IDLE_UNLOAD_S). The GLM-only pins (the RAM tier,
-    # the slots, the ablation vector) do not apply to maya-hy4: its experts come from the
-    # model file's page cache, which the container's memory limit bounds by itself.
+    # which the model unloads itself (MAYA_IDLE_UNLOAD_S). MAYA_HY4_ABLATE pins the
+    # refusal-direction vector in the env section the way GLM's MAYA_ABLATE does: the engine
+    # reads HY4_ABLATE (the file; its header must match the model's geometry - a wrong one
+    # ends the load) at every start, so it can be turned on or off without re-running a
+    # setup. A missing file ends the start here: the model would answer as the stock one
+    # until the vector is in place. The GLM-only pins that remain (the RAM tier, the slots)
+    # do not apply to maya-hy4: its experts come from the model file's page cache, which
+    # the container's memory limit bounds by itself.
     with open(cfg) as f:
         c = json.load(f)
     c["idle_unload_s"] = int(env["MAYA_IDLE_UNLOAD_S"] or 0)
+    c.setdefault("env", {})
+    for k in ("HY4_ABLATE", "HY4_ABLATE_SCALE"):
+        c["env"].pop(k, None)
+    a = env["MAYA_HY4_ABLATE"].strip()
+    if a and a.lower() not in ("off", "no", "0", "false"):
+        vec = a
+        if a.lower() in ("on", "yes", "1", "true"):
+            vec = os.path.join(hy4_dir, "Hy4-flash-refusal-directions.bin")
+        if not os.path.isfile(vec):
+            sys.exit(f"entrypoint: MAYA_HY4_ABLATE={a}: {vec} is not there - put the vector in the models mount "
+                     "or set MAYA_HY4_ABLATE=off")
+        c["env"]["HY4_ABLATE"] = vec
+        say(f"[entrypoint] Hy4 ablation on: {vec}")
     args = c.get("args") or []
     args = set_flag(args, "--max-context", int(env["MAYA_CONTEXT"]))
     args = kv_flags(args, "HY4")

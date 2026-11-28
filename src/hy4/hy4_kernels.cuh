@@ -65,6 +65,11 @@ void hc_post(float* x, int T, int hc, int E, const float* y, const float* post, 
 /// written there too, null: not)
 void hc_post_norm(float* x, int T, int hc, int E, const float* y, const float* post, const float* w, float eps,
                   cudaStream_t s, float* yo = nullptr);
+/// HY4_ABLATE (hy4_ablate.cuh): the streams of x [T][hc][E] lose their components along their k orthonormal refusal
+/// directions of `point` (the file's rows: x[t][s] -= scale (x[t][s] . v_sj) v_sj).  No-op when the file is not
+/// loaded.  (the points: 0..layers - 1 the stream entering the layer's attention, layers the stream leaving the
+/// last one)
+void hc_ablate(float* x, int T, int hc, int E, int point, cudaStream_t s);
 /// (hc_pre with norm_w: cur is the RMS norm of the mix with that weight - the layer's attn_norm / ffn_norm folded in)
 
 /// RoPE (ggml's NORM: consecutive pairs) in place over dims [off, off + n_rot) of every head: x[t][h][ld], h < nh,

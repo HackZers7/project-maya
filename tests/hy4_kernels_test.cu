@@ -1,9 +1,11 @@
 // tests/hy4_kernels_test.cu - maya-hy4's own kernels (src/hy4/hy4_kernels.cu) against double-precision references on the
 // host (no model): the hyper-connections' pre-mix (with its norm folded in), post-mix and head; RoPE and the latent
 // cache rows; the MLA attention with sinks over a window ring and over a key list; the router; the indexer's pooled
-// keys, scores and picks (ties included); Engram's rows and mix; a row's top token (row_top).
+// keys, scores and picks (ties included); Engram's rows and mix; a row's top token (row_top); the refusal directions'
+// projection (HY4_ABLATE).
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <numeric>
@@ -13,6 +15,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "../src/hy4/hy4_ablate.cuh"
 #include "../src/hy4/hy4_kernels.cuh"
 #include "../src/hy4/hy4_plan.hpp"
 #include "../src/hy4/hy4_plan.hpp"
@@ -1055,6 +1058,119 @@ void test_dfly_expand_keys() {
     for (int* p : {dsnap, dsnap_nk, dkeys, dnk}) cudaFree(p);
 }
 
+// HY4_ABLATE (hy4_ablate.cuh, projected by k::hc_ablate): with no file nothing runs (the rows stay bit for bit); a
+// file's header read and checked (a wrong one refuses the setup); a point's directions projected out of their
+// (row, stream) against a double-precision reference - the dot with the direction drops to (1 - scale) of it, the
+// point's own vectors used (not another point's)
+void ablate_write(const char* path, int pts, int hc, int dirs, int E, const std::vector<float>& v) {
+    std::FILE* f = std::fopen(path, "wb");
+    const int32_t h[4] = {pts, hc, dirs, E};
+    std::fwrite(h, sizeof(h), 1, f);
+    std::fwrite(v.data(), 4, v.size(), f);
+    std::fclose(f);
+}
+
+void test_ablate() {
+    const int pts = 3, hc = 4, dirs = 2;
+    std::mt19937 rng(77u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const float scale = 0.7f;
+    const int T = 5;
+    for (int E : {96, 3072}) {
+        // the file's directions: each row orthogonalized against the previous rows' float bits and normalized (so the
+        // (1 - scale) dot check below does not pay the quantization's cross terms), point p's stream s's rows at
+        // (p * hc + s) * dirs
+        std::vector<float> v((size_t) pts * hc * dirs * E);
+        for (int p = 0; p < pts; ++p)
+            for (int s = 0; s < hc; ++s)
+                for (int j = 0; j < dirs; ++j) {
+                    float* u = v.data() + ((size_t) p * hc + s) * dirs * E + (size_t) j * E;
+                    for (int e = 0; e < E; ++e) u[e] = nd(rng);
+                    for (int q = 0; q < j; ++q) {
+                        const float* prev = v.data() + ((size_t) p * hc + s) * dirs * E + (size_t) q * E;
+                        double d = 0.0;
+                        for (int e = 0; e < E; ++e) d += (double) u[e] * (double) prev[e];
+                        for (int e = 0; e < E; ++e) u[e] = (float) ((double) u[e] - d * (double) prev[e]);
+                    }
+                    double n = 0.0;
+                    for (int e = 0; e < E; ++e) n += (double) u[e] * (double) u[e];
+                    n = std::sqrt(n);
+                    for (int e = 0; e < E; ++e) u[e] = (float) ((double) u[e] / n);
+                }
+        // rows with a strong component along point 1's directions (a wrong point offset fails)
+        std::vector<float> x((size_t) T * hc * E);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = nd(rng);
+        for (int t = 0; t < T; ++t)
+            for (int s = 0; s < hc; ++s)
+                for (int j = 0; j < dirs; ++j)
+                    for (int e = 0; e < E; ++e)
+                        x[((size_t) t * hc + s) * E + e] +=
+                            (float) ((t + 1) * (j + 1) * 2) * v[((size_t) hc + s) * dirs * E + (size_t) j * E + e];
+        // 1. no file: nothing runs, the rows stay bit for bit
+        CHECK(!hy4_ablate::on());
+        float* dx = dev(x);
+        hy4::k::hc_ablate(dx, T, hc, E, 1, nullptr);
+        CHECK(host(dx, x.size()) == x);
+        // 2. a wrong header refuses the setup, the state stays off
+        const char* path = "/tmp/hy4_ablate_test.bin";
+        ablate_write(path, pts + 1, hc, dirs, E, v);
+        setenv("HY4_ABLATE", path, 1);
+        setenv("HY4_ABLATE_SCALE", "0.7", 1);   // (the reference below projects at 0.7)
+        std::string err;
+        CHECK(!hy4_ablate::setup(pts, hc, E, err) && !hy4_ablate::on());
+        // 3. the file read in, point 1 projected: every (row, stream) against the double reference, the dot with the
+        // direction at (1 - scale) of it, and point 0's projection used point 0's vectors on a second buffer
+        ablate_write(path, pts, hc, dirs, E, v);
+        CHECK(hy4_ablate::setup(pts, hc, E, err));
+        float* dy = dev(x);
+        hy4::k::hc_ablate(dy, T, hc, E, 1, nullptr);
+        hy4::k::hc_ablate(dy, T, hc, E, pts + 2, nullptr);   // (out of range: no-op)
+        const std::vector<float> got = host(dy, x.size());
+        float* dz = dev(x);
+        hy4::k::hc_ablate(dz, T, hc, E, 0, nullptr);
+        const std::vector<float> got0 = host(dz, x.size());
+        for (int t = 0; t < T; ++t)
+            for (int s = 0; s < hc; ++s) {
+                // the reference projects with the file's own float values (the kernel's bits), accumulated in double
+                const float* vp = v.data() + ((size_t) hc + s) * dirs * E;   // point 1, stream s, its dirs
+                std::vector<double> ref(x.begin() + ((ptrdiff_t) t * hc + s) * E,
+                                        x.begin() + ((ptrdiff_t) t * hc + s + 1) * E);
+                for (int j = 0; j < dirs; ++j) {
+                    double before = 0.0;
+                    for (int e = 0; e < E; ++e) before += ref[(size_t) e] * (double) vp[(size_t) j * E + e];
+                    for (int e = 0; e < E; ++e) ref[(size_t) e] -= scale * before * (double) vp[(size_t) j * E + e];
+                }
+                const float* g = got.data() + ((size_t) t * hc + s) * E;
+                CHECK(rel(std::vector<float>(g, g + E), ref) < 1e-5);
+                double before0 = 0.0, after0 = 0.0;
+                for (int e = 0; e < E; ++e) {
+                    before0 += (double) x[((size_t) t * hc + s) * E + e] * (double) vp[e];
+                    after0 += (double) g[e] * (double) vp[e];
+                }
+                CHECK(std::fabs(after0 - (1.0 - scale) * before0) <= 1e-5 * std::fabs(before0));
+                // (point 0's projection: the same reference with point 0's values)
+                const float* vp0 = v.data() + (size_t) s * dirs * E;   // point 0, stream s, its dirs
+                const float* z = got0.data() + ((size_t) t * hc + s) * E;
+                std::vector<double> ref0(x.begin() + ((ptrdiff_t) t * hc + s) * E,
+                                         x.begin() + ((ptrdiff_t) t * hc + s + 1) * E);
+                for (int j = 0; j < dirs; ++j) {
+                    double b = 0.0;
+                    for (int e = 0; e < E; ++e) b += ref0[(size_t) e] * (double) vp0[(size_t) j * E + e];
+                    for (int e = 0; e < E; ++e) ref0[(size_t) e] -= scale * b * (double) vp0[(size_t) j * E + e];
+                }
+                CHECK(rel(std::vector<float>(z, z + E), ref0) < 1e-5);
+            }
+        cudaFree(dx);
+        cudaFree(dy);
+        cudaFree(dz);
+        hy4_ablate::state().on = false;   // (the state is global: leave it off for the rest of the suite)
+    }
+    unsetenv("HY4_ABLATE");
+    unsetenv("HY4_ABLATE_SCALE");
+    std::remove("/tmp/hy4_ablate_test.bin");
+    CHECK(!hy4_ablate::on());
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1069,6 +1185,7 @@ int main() {
     test_engram();
     test_row_top();
     test_dfly_expand_keys();
+    test_ablate();
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

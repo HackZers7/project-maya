@@ -15,6 +15,7 @@
 #include "hy4_model.hpp"
 
 #include "hy4_kernels.cuh"
+#include "hy4_ablate.cuh"
 #include "hy4_lane.hpp"
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
@@ -4741,6 +4742,7 @@ struct Model::Impl {
 #endif
         for (auto& gp : G) st.vram_gb += (double) gp.used / 1e9;
         st.load_s = now_s() - t0;
+        if (!hy4_ablate::setup(g.n_layer + 1, g.hc, g.n_embd, err)) return false;   // HY4_ABLATE (the refusal directions)
         char buf[512];
         std::snprintf(buf, sizeof buf, "INFO maya-hy4: Hy4-flash, %d layers, %d experts (%d a token), context %lld, %.1f GB "
                                        "of VRAM over %zu GPUs, loaded in %.1f s",
@@ -5272,6 +5274,7 @@ struct Model::Impl {
         const int E = g.n_embd;
         cudaStream_t s = gp.s;
         if (inject) k::set_mix_out(gp.rl);
+        k::hc_ablate(gp.x, T, g.hc, E, l.il, s);   // HY4_ABLATE: the stream entering the layer, before its mix reads it
         // (xa's int8 rows from the mix's own launch: the stream's GEMVs', and the side stream's where the layer forks)
         const bool f8 = q8f(T), af8 = !l.ix && T <= W && gp.atf && gp.s4 != nullptr && !dump && !inject;
         const bool xa_pre = k::hc_pre(gp.x, T, g.hc, E, l.hca_fn, l.hca_scale, l.hca_base, g.eps, g.hc_eps, g.hc_mag, gp.xa,
@@ -9080,9 +9083,10 @@ struct Model::Impl {
     // then the wanted rows' logits, and the MTP block over the chunk (its own caches).  Queued, not waited for.
     // (HY4_PP: x_in - a pipelined chunk's final state in pp.hx, stage 1's copy of it; null: hg.x, as before)
     bool head_tail(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err,
-                   const float* x_in = nullptr) {
+                   float* x_in = nullptr) {
         const int E = g.n_embd, hc = g.hc;
         Gpu& hg = G[(size_t) head_gpu];
+        k::hc_ablate(x_in ? x_in : hg.x, T, hc, E, g.n_layer, hg.s);   // HY4_ABLATE: the stream leaving the last layer
         k::hc_head(x_in ? x_in : hg.x, T, hc, E, hh_fn, hh_scale, hh_base, g.eps, g.hc_eps, hg.hcur, hg.s, hc_el());
         dbg("hc_head", -1, hg, hg.hcur + (size_t) (T - 1) * E, 1, E);
         k::rmsnorm(hg.hcur, E, T, E, out_norm, g.eps, hg.hcur, E, hg.s);
@@ -9856,6 +9860,7 @@ struct Model::Impl {
     // a half's attention: the inputs (Engram), the pre-mix, the attention, its partial out
     bool attn_out(Layer& l, Gpu& gv, int T, int64_t p0, int r0, int m, unsigned v, std::string& err) {
         if (l.eg >= 0 && !engram(l, gv, T, err, r0)) return false;
+        k::hc_ablate(gv.x, T, g.hc, g.n_embd, l.il, gv.s);   // HY4_ABLATE: the staggered half's rows, as attention() does
         k::hc_pre(gv.x, T, g.hc, g.n_embd, l.hca_fn, l.hca_scale, l.hca_base, g.eps, g.hc_eps, g.hc_mag, gv.xa, gv.post,
                   gv.s, l.attn_norm, g.eps, hc_el());
         if (!attn_core(l, gv, T, p0, err, m, v)) return false;
@@ -9985,6 +9990,7 @@ struct Model::Impl {
     bool member_head(int m, Gpu& gp, int T, int want, float* logits_out, unsigned xv, std::string& err) {
         const int E = g.n_embd, hc = g.hc, nr = head_rows, r0 = m * head_rows;
         const HeadPart& hp = head_m[(size_t) m];
+        k::hc_ablate(gp.x + (size_t) (T - want) * hc * E, want, hc, E, g.n_layer, gp.s);   // HY4_ABLATE: the head's rows
         k::hc_head(gp.x + (size_t) (T - want) * hc * E, want, hc, E, hp.fn, hp.scale, hp.base, g.eps, g.hc_eps, gp.hcur,
                    gp.s, hc_el());
         k::rmsnorm(gp.hcur, E, want, E, hp.norm, g.eps, gp.hcur, E, gp.s);
