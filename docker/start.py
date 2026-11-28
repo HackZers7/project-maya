@@ -51,7 +51,13 @@ DEFAULTS = {
     "MAYA_VISION": "yes",                  # "no": the model reads text only
     "MAYA_VISION_THREADS": "8",            # CPU threads of the image encoder (it runs in RAM, not on a GPU)
     "MAYA_KV_STREAMING": "on",             # "on": the attention cache lives in RAM with a VRAM window (v1.1.6+)
-    "MAYA_KV_RESIDENT": "65536",           # KV streaming's window, in context positions, kept in VRAM
+    "MAYA_KV_RESIDENT": "auto",            # the shared KV streaming window, in context positions, that a model
+                                           # takes while its own knob below is unset (kept so an older compose
+                                           # file keeps working)
+    "MAYA_GLM_KV_RESIDENT": "",            # GLM's KV streaming window (--kv-resident): unset = MAYA_KV_RESIDENT;
+                                           # "auto" is the engine's own default (32768)
+    "MAYA_HY4_KV_RESIDENT": "",            # Hy4's KV streaming window (its --kv-resident): unset = MAYA_KV_RESIDENT;
+                                           # "auto" is the engine's own default (32768)
     "MAYA_PREFILL": "auto",                # the shared prefill chunk, in tokens, that a model takes while its own
                                            # knob below is unset (kept so an older compose file keeps working)
     "MAYA_GLM_PREFILL": "",                # GLM's prefill chunk (--prefill): unset = MAYA_PREFILL; "auto" is the
@@ -77,6 +83,15 @@ DEFAULTS = {
     "MAYA_MODEL": "glm-5.3-flash",         # the default model: "glm-5.3-flash" or "hy4-flash"
 }
 env = {k: os.environ.setdefault(k, v) for k, v in DEFAULTS.items()}
+# the per-model KV windows must not reach the engines raw: MAYA_GLM_KV_RESIDENT is also the
+# name the GLM engine itself carries --kv-resident under, and there the environment is
+# sticky - a var present beats the engine's own --kv-resident (and "auto" would atoll() to
+# 0: the whole cache in VRAM). The start resolves the knobs into the config's args instead
+# (kv_flags below), from where GLM publishes the value into its own environment and Hy4
+# reads the flag directly; the shared MAYA_KV_RESIDENT is no engine's name and stays.
+for _knob in DEFAULTS:
+    if _knob.endswith("_KV_RESIDENT") and _knob != "MAYA_KV_RESIDENT":
+        os.environ.pop(_knob, None)
 
 say = lambda *a: print(*a, flush=True)   # noqa: E731  every line here goes to `docker logs`
 
@@ -95,15 +110,22 @@ def set_flag(args: list[str], flag: str, value=None) -> list[str]:
     return out
 
 
-def kv_flags(args: list[str]) -> list[str]:
+def kv_resident(model: str) -> str:
+    """The model's (GLM / HY4) KV streaming window: its own knob wins, else the shared
+    MAYA_KV_RESIDENT (an older compose file sets that alone); "auto" - the engine's own
+    default (32768)."""
+    return env[f"MAYA_{model}_KV_RESIDENT"] or env["MAYA_KV_RESIDENT"]
+
+
+def kv_flags(args: list[str], model: str) -> list[str]:
     """The KV streaming pair in the engine's args (the setup knows no --kv-* switches, so
     they are written here at every start): on keeps the attention cache in RAM with
-    MAYA_KV_RESIDENT positions of it in VRAM (the freed VRAM holds routed experts); off
+    kv_resident(model) positions of it in VRAM (the freed VRAM holds routed experts); off
     keeps all of the KV in VRAM."""
     on = env["MAYA_KV_STREAMING"] == "on"
-    resident = env["MAYA_KV_RESIDENT"]
+    resident = kv_resident(model)
     args = set_flag(args, "--kv-streaming", "on" if on else "off")
-    if on and resident:
+    if on and resident and resident != "auto":
         return set_flag(args, "--kv-resident", int(resident))
     return set_flag(args, "--kv-resident")
 
@@ -191,7 +213,7 @@ def manage_hy4(cfg: str) -> None:
     c["idle_unload_s"] = int(env["MAYA_IDLE_UNLOAD_S"] or 0)
     args = c.get("args") or []
     args = set_flag(args, "--max-context", int(env["MAYA_CONTEXT"]))
-    args = kv_flags(args)
+    args = kv_flags(args, "HY4")
     chunk = prefill("HY4")
     args = set_flag(args, "--chunk", int(chunk) if chunk != "auto" else None)
     c["args"] = args
@@ -309,7 +331,7 @@ def manage_glm(cfg: str) -> None:
         c["vision"]["gpu"] = False
         c["vision"]["threads"] = int(env["MAYA_VISION_THREADS"])
     args = c.get("args") or []
-    args = kv_flags(args)
+    args = kv_flags(args, "GLM")
     # the prefill chunk: the engine's --prefill flag, pinned like the KV pair so it can be
     # changed any time (prefill(): the model's own knob, else MAYA_PREFILL, else "auto" -
     # the engine's own sizing, 8192 on this split)
