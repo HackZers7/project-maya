@@ -52,7 +52,13 @@ DEFAULTS = {
     "MAYA_VISION_THREADS": "8",            # CPU threads of the image encoder (it runs in RAM, not on a GPU)
     "MAYA_KV_STREAMING": "on",             # "on": the attention cache lives in RAM with a VRAM window (v1.1.6+)
     "MAYA_KV_RESIDENT": "65536",           # KV streaming's window, in context positions, kept in VRAM
-    "MAYA_PREFILL": "auto",                # the prefill chunk, in tokens: "auto" is the engine's own sizing
+    "MAYA_PREFILL": "auto",                # the shared prefill chunk, in tokens, that a model takes while its own
+                                           # knob below is unset (kept so an older compose file keeps working)
+    "MAYA_GLM_PREFILL": "",                # GLM's prefill chunk (--prefill): unset = MAYA_PREFILL; "auto" is the
+                                           # engine's own sizing (8192 on this split)
+    "MAYA_HY4_PREFILL": "",                # Hy4's prefill chunk (maya-hy4's --chunk): unset = MAYA_PREFILL; "auto"
+                                           # is the engine plan's (4096 a step here); a number stages the chunk's
+                                           # rows in RAM in proportion to it
     "MAYA_PARALLEL": "1",                  # how many requests decode at once (1-8): a maya.py switch
     "MAYA_ABLATE": "off",                  # "on": the abliterated model (the vector is <GGUF tree>/vector/<file>);
                                            # "off": the stock model; anything else: a vector file's path to use
@@ -100,6 +106,12 @@ def kv_flags(args: list[str]) -> list[str]:
     if on and resident:
         return set_flag(args, "--kv-resident", int(resident))
     return set_flag(args, "--kv-resident")
+
+
+def prefill(model: str) -> str:
+    """The model's (GLM / HY4) prefill chunk: its own knob wins, else the shared MAYA_PREFILL
+    (an older compose file sets that alone), else auto - the engine's own sizing."""
+    return env[f"MAYA_{model}_PREFILL"] or env["MAYA_PREFILL"] or "auto"
 
 
 def seed_data() -> None:
@@ -167,9 +179,10 @@ def manage_hy4(cfg: str) -> None:
         say(f"[entrypoint] configuration kept in {cfg}")
 
     # the engine flags applied to the kept config at every start: the context from
-    # MAYA_CONTEXT, KV streaming, the prompt chunk - maya-hy4's own --chunk (auto: the
-    # engine's plan picks it, 4096 a step here; a number sets it, and the chunk's staged
-    # rows sit in RAM in proportion to it). idle_unload_s is the inactivity timeout after
+    # MAYA_CONTEXT, KV streaming, the prompt chunk - maya-hy4's own --chunk (MAYA_HY4_PREFILL,
+    # the shared MAYA_PREFILL while it is unset; auto: the engine's plan picks it, 4096 a
+    # step here; a number sets it, and the chunk's staged rows sit in RAM in proportion to
+    # it). idle_unload_s is the inactivity timeout after
     # which the model unloads itself (MAYA_IDLE_UNLOAD_S). The GLM-only pins (the RAM tier,
     # the slots, the ablation vector) do not apply to maya-hy4: its experts come from the
     # model file's page cache, which the container's memory limit bounds by itself.
@@ -179,8 +192,8 @@ def manage_hy4(cfg: str) -> None:
     args = c.get("args") or []
     args = set_flag(args, "--max-context", int(env["MAYA_CONTEXT"]))
     args = kv_flags(args)
-    prefill = env["MAYA_PREFILL"]
-    args = set_flag(args, "--chunk", int(prefill) if prefill and prefill != "auto" else None)
+    chunk = prefill("HY4")
+    args = set_flag(args, "--chunk", int(chunk) if chunk != "auto" else None)
     c["args"] = args
     with open(cfg, "w") as f:
         json.dump(c, f, indent=1)
@@ -298,8 +311,9 @@ def manage_glm(cfg: str) -> None:
     args = c.get("args") or []
     args = kv_flags(args)
     # the prefill chunk: the engine's --prefill flag, pinned like the KV pair so it can be
-    # changed any time ("auto" keeps the engine's own sizing, 8192 on this split)
-    args = set_flag(args, "--prefill", env["MAYA_PREFILL"] or "auto")
+    # changed any time (prefill(): the model's own knob, else MAYA_PREFILL, else "auto" -
+    # the engine's own sizing, 8192 on this split)
+    args = set_flag(args, "--prefill", prefill("GLM"))
     c["args"] = args
     with open(cfg, "w") as f:
         json.dump(c, f, indent=1)
