@@ -3411,6 +3411,9 @@ class Service:
             self.engine, self.tok, self.template = engine, parts.tok, parts.template
             self.sampling_defaults = dict(parts.sampling_defaults or {})
             self._derive_stop_state()
+            # (the hot swap: these hold the last model's tokenizer and literals - a prompt prepared now would carry
+            #  its ids, which the new model's engine has no room for: "token id N outside the vocabulary")
+            self._lit_memo, self._prompt_memo = None, None
         self.model = cfg.get("model_name", "qwen3.8-flash-next")
         self.vision = vision
         self.fit_max_tokens = a.fit_max_tokens or cfg.get("fit_max_tokens") is True

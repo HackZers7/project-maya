@@ -344,6 +344,39 @@ class LiteralMemoSame(unittest.TestCase):
                              mark_literals(copy.deepcopy(messages), None, tags))
 
 
+class SameIdsAfterTheHotSwitch(_MemoEnv, unittest.TestCase):
+    def test_the_switch_rebuilds_the_memo_on_the_new_model(self):
+        """Service.remodel (the hot swap) rebuilds the prompt memos with the new model's tokenizer: a prompt prepared
+        after the switch is the new model's ids.  The last model's would hand the engine ids its vocabulary has no
+        room for ('token id N outside the vocabulary')."""
+        from types import SimpleNamespace
+        svc = service("glm5")
+        convo = [{"role": "system", "content": "You are helpful."},
+                 {"role": "user", "content": CORPUS[:600]},
+                 {"role": "assistant", "content": "Done."},
+                 {"role": "user", "content": "Go on."}]
+        os.environ["MAYA_PROMPT_MEMO"] = "1"
+        m, t, kw = openai_to_messages({"messages": copy.deepcopy(convo)})
+        svc.render_ids(m, t, kw)                     # (the memo now lives on glm5's tokenizer)
+        self.assertIsNotNone(getattr(svc, "_prompt_memo", None))
+
+        other = service("qwen")                      # the swap, as _swap_run does it: remodel around a new engine
+        parts = SimpleNamespace(tok=other.tok, template=other.template, sampling_defaults={}, config_path=None,
+                                savings=None, shared_path=None, shared={})
+        args = SimpleNamespace(fit_max_tokens=False, idle_unload=None, engine="maya", config=None, api_key="")
+        svc.remodel(args, {}, parts, other.engine, None, None, unloaded=False)
+        self.assertIs(svc.tok, other.tok)
+
+        longer = {"messages": convo + [{"role": "user", "content": "Thanks, and one more thing."}]}
+        m, t, kw = openai_to_messages(copy.deepcopy(longer))
+        memo = svc.render_ids(m, t, kw)              # (the env var is still "1": the memo path)
+        self.assertTrue(svc._prompt_memo.usable(), "the memo must run after the switch (not fall back)")
+        os.environ["MAYA_PROMPT_MEMO"] = "0"
+        m, t, kw = openai_to_messages(copy.deepcopy(longer))
+        full = svc.render_ids(m, t, kw)
+        self.assertEqual(memo, full, "after the switch: the memo's ids are not the new model's")
+
+
 class RestorePointsFast(unittest.TestCase):
     def test_the_same_as_the_original(self):
         rng = random.Random(7)
